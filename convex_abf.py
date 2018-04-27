@@ -821,30 +821,49 @@ def updateRunningSum( slidingWindow, newBlock, runningSum ):
         runningSum += newBlock
 
 class Beamformer:
-    def __init__( self, arrayGeometry, outputBeams, snapshotAverageCount, speedOfSound ):
+    def __init__( self, arrayGeometry, outputBeams, snapshotAverageCount, speedOfSound,
+                 memoryBudgetMB = 1024 ):
         assert snapshotAverageCount > 0
 
         self._arrayGeometry = arrayGeometry
         self._outputBeams = outputBeams
         self._snapshotAverageCount = snapshotAverageCount
         self._speedOfSound = speedOfSound
+        self._memoryBudgetMB = memoryBudgetMB
+
+    @property
+    def _NumberElements( self ):
+        return self._arrayGeometry.NumberElements
+
+    @property
+    def _NumberDirections( self ):
+        return len( self._outputBeams )
 
     def process( self, inputFileName, outputFileName ):
-        with FourierSpectra.open( inputFileName ) as inputFft:
-            # First compute the optimal snapshot buffer size.
-            numberBufferedSnapshots = self._computeNumberBufferedSnapshots( inputFft.NumberBins )
+        with FourierSpectra.open( inputFileName ) as inputFft, \
+            FourierSpectra.create( inputFft.FftLength, self._NumberDirections,
+                                  inputFft.SamplingRate, outputFileName ) as outputFft:
+            # Figure out which process method we're using.
+            innerProcess, numberBufferedSnapshots = self._selectProcess( inputFft.NumberBins )
+            innerProcess( inputFft, outputFft, numberBufferedSnapshots )
 
-            #The motivation for this is that
-            # broadband beamforming is both memory and compute bound. If we were to store all
-            steeringVectors = self._computeSteeringVectors( inputFft )
+    def _precomputeProcess( self, inputFft, outputFft, numberBufferedSnapshots ):
+        print( "Precompute" )
+        pass
 
-            with FourierSpectra.create( inputFft.FftLength, len(self._outputBeams),
-                                       inputFft.SamplingRate, outputFileName ) as outputFft:
-                pass
+    def _amortizedProcess( self, inputFft, outputFft, numberBufferedSnapshots ):
+        print( "Amortized" )
+        pass
 
-    def _computeNumberBufferedSnapshots( self, numberBins ):
+    def _selectProcess( self, numberBins ):
         """
-        Computes the number of input FFT snapshots to read and buffer at a time.
+        Determines whether to process the input snapshots using a total precomputation strategy
+        that avoids recomputation of steering vectors at the expense of memory or an amortized
+        recompute strategy that attempts to minimize the number of times steering vectors are
+        recomputed by maximizing the number of input snapshots that are buffered subject to a
+        (hard) minimum snapshot threshold and a (soft) memory budget. Returns the method that
+        implements the selected strategy as well as the number of input snapshots to read and
+        buffer at a time.
 
         The motivation for this is that broadband beamforming where we take an FFT of a signal and
         perform narrowband beamforming on the individual frequency components is both memory and
@@ -852,9 +871,10 @@ class Beamformer:
 
         To illustrate, let N be the number of input elements, M the number of frequency bins, Q the
         number of output beams, and J the number of snapshots we need to average to build our CSM.
-        In order to keep our beamformer output within 3 dB of the optimal SINR, we need to ensure
-        the number of snapshots we use for computing the cross spectral matrix is at least twice
-        the number of elements.
+        In order to keep our beamformer output within 3 dB of the optimal SINR, the snapshot average
+        count used for computing the cross spectral matrix SHOULD have been set to at least twice
+        the number of array elements, but if analyst wants to break that design rule, we don't do
+        anything to prevent that.
 
         Consider that to compute the weights for a single frequency for a single output beam, we
         need NQ + MNJ + MQ many complex values stored in memory. For the next beam or frequency
@@ -872,19 +892,41 @@ class Beamformer:
         It is obvious there's a tension between being memory efficient and being compute efficient.
         We note that if we read and buffer J' snapshots (J' > J), we can begin to amortize the cost
         of recomputing steering vectors. This is because for each block of J' snapshots we read in,
-        we can compute the steering vectors for a single (frequency, beam) pair and use them to
+        we can compute the steering vector for a single (frequency, beam) pair and use it to
         calculate the corresponding weights for J' - J output snapshots before needing to recompute
-        the steering vectors for either the next beam or next frequency.
+        the steering vector for either the next beam or next frequency.
 
         This strategy requires storing NQ + MNJ' + MQ(J' - J + 1) complex values in memory. The
         breakeven point is the largest value of J' that results in less memory consumption than
         the full precomputation method. However, rarely do we want to choose this for J'; othewise,
         we gain no benefit since we will consume the same order of memory for a more computationally
-        expensive process. Instead we may constrain J' to be no larger than some memory budget,
-        which can be readily solved.
+        expensive process. Instead we may constrain J' to be no larger than some memory budget
+        that's less than the amount needed for the full precomputation method. Given this memory
+        budget, the value for J' is readily solved.
 
         """
-        pass
+        # First see if the full precompute method uses the same or less memory than the memory
+        # budget. If so, then there's no need for the more complicated amortized method.
+        complexItemSize = float( np.dtype( np.complex ).itemsize )
+        numberElements = self._NumberElements
+        numberDirections = self._NumberDirections
+        precomputeMemoryMB = ((numberBins * numberElements * numberDirections) +
+                              (numberBins * numberElements * self._snapshotAverageCount) +
+                              (numberBins * numberDirections)) * complexItemSize / 1024**2
+
+        if precomputeMemoryMB <= self._memoryBudgetMB:
+            return (self._precomputeProcess, self._snapshotAverageCount)
+
+        numberBufferedSnapshots = np.floor( ((self._memoryBudgetMB * 1024**2 / complexItemSize) -
+                                             numberElements * numberDirections +
+                                             numberBins * numberDirections * self._snapshotAverageCount -
+                                             numberBins * numberDirections) /
+                                            (numberBins * numberElements +
+                                             numberBins * numberDirections) ).astype( int )
+
+        # We need to buffer at least our snapshot average count.
+        numberBufferedSnapshots = np.maximum( self._snapshotAverageCount, numberBufferedSnapshots )
+        return (self._amortizedProcess, numberBufferedSnapshots)
 
     def _computeSteeringVectors( self, inputFft ):
         numberElements = self._arrayGeometry.NumberElements
@@ -900,6 +942,7 @@ outputFolder = pathlib.Path( tempfile.gettempdir(), 'convexAbf' )
 outputFolder.mkdir( parents=True, exist_ok=True )
 etsFileName = str( outputFolder / 'array.ets' )
 elementFftFileName = str( outputFolder / 'element.fft' )
+beamformedFftFileName = str( outputFolder / 'beamformed.fft' )
 
 ##  ARRAY DESIGN ##
 speedOfSound = 1480.0
@@ -959,11 +1002,14 @@ arraySim.addTarget( Target( PositionAzEl( azimuth=-45.0 ),
 
 # Run the simulation.
 numberSnapshots = 30
-arraySim.simulate( numberSnapshots, etsFileName )
+#arraySim.simulate( numberSnapshots, etsFileName )
 
 # Produce the Fourier spectra of our time series.
 transformer = FourierTransformer( window=HannWindow() )
-transformer.transformTimeSeries( etsFileName, elementFftFileName )
+#transformer.transformTimeSeries( etsFileName, elementFftFileName )
+
+#b = Beamformer( geometry, [Beam( az, 0.0 ) for az in np.linspace( -90, 90, 100 )], 42, 1480.0 )
+#b.process( elementFftFileName, beamformedFftFileName )
 
 ## TESTING ##
 import warnings
