@@ -387,17 +387,7 @@ class ArraySimulator:
         #       -sin(theta) * sin(phi)
         #       -cos(theta) ]
         #
-        polar = np.radians( sourcePosition.PolarAngle )
-        azimuth = np.radians( sourcePosition.Azimuth )
-        sinElevation = np.sin( polar )
-        sinAzimuth = np.sin( azimuth )
-        cosElevation = np.cos( polar )
-        cosAzimuth = np.cos( azimuth )
-
-        xA = sinElevation * cosAzimuth
-        yA = sinElevation * sinAzimuth
-        zA = cosElevation
-
+        xA, yA, zA = sphericalToUnitCartesian( sourcePosition.Azimuth, sourcePosition.PolarAngle )
         dotProducts = np.sum( np.stack( (xA * self._geometry.X,
                                          yA * self._geometry.Y,
                                          zA * self._geometry.Z) ), axis=0 )
@@ -737,7 +727,7 @@ class FourierTransformer:
             return False
 
 class Beam:
-    def __init__( self, azimuth, elevation ):
+    def __init__( self, azimuth, elevation=0.0 ):
         self.Azimuth = azimuth
         self.Elevation = elevation
 
@@ -836,7 +826,7 @@ class Beamformer:
         return self._arrayGeometry.NumberElements
 
     @property
-    def _NumberDirections( self ):
+    def _NumberBeams( self ):
         return len( self._outputBeams )
 
     def process( self, inputFileName, outputFileName ):
@@ -848,12 +838,22 @@ class Beamformer:
             innerProcess( inputFft, outputFft, numberBufferedSnapshots )
 
     def _precomputeProcess( self, inputFft, outputFft, numberBufferedSnapshots ):
-        print( "Precompute" )
-        pass
+        numberBins = inputFft.NumberBins
+        numberBeams = self._NumberBeams
+        numberElements = self._NumberElements
+
+        # First precompute all of our steering vectors that we will use.
+        steeringVectors = self._computeSteeringVectors( inputFft.BinFrequencies )
+
+        # Allocate the output snapshot.
+        outputSnapshot = np.empty( shape=(numberBins, numberBeams), dtype=np.complex )
+
+        # Allocate the input snapshot buffer.
+        inputSnapshots = np.empty( shape=(numberBufferedSnapshots, numberBins, numberElements),
+                                  dtype=np.complex )
 
     def _amortizedProcess( self, inputFft, outputFft, numberBufferedSnapshots ):
         print( "Amortized" )
-        pass
 
     def _selectProcess( self, numberBins ):
         """
@@ -909,31 +909,90 @@ class Beamformer:
         # budget. If so, then there's no need for the more complicated amortized method.
         complexItemSize = float( np.dtype( np.complex ).itemsize )
         numberElements = self._NumberElements
-        numberDirections = self._NumberDirections
-        precomputeMemoryMB = ((numberBins * numberElements * numberDirections) +
+        numberBeams = self._NumberBeams
+        precomputeMemoryMB = ((numberBins * numberElements * numberBeams) +
                               (numberBins * numberElements * self._snapshotAverageCount) +
-                              (numberBins * numberDirections)) * complexItemSize / 1024**2
+                              (numberBins * numberBeams)) * complexItemSize / 1024**2
 
         if precomputeMemoryMB <= self._memoryBudgetMB:
             return (self._precomputeProcess, self._snapshotAverageCount)
 
         numberBufferedSnapshots = np.floor( ((self._memoryBudgetMB * 1024**2 / complexItemSize) -
-                                             numberElements * numberDirections +
-                                             numberBins * numberDirections * self._snapshotAverageCount -
-                                             numberBins * numberDirections) /
+                                             numberElements * numberBeams +
+                                             numberBins * numberBeams * self._snapshotAverageCount -
+                                             numberBins * numberBeams) /
                                             (numberBins * numberElements +
-                                             numberBins * numberDirections) ).astype( int )
+                                             numberBins * numberBeams) ).astype( int )
 
         # We need to buffer at least our snapshot average count.
         numberBufferedSnapshots = np.maximum( self._snapshotAverageCount, numberBufferedSnapshots )
         return (self._amortizedProcess, numberBufferedSnapshots)
 
-    def _computeSteeringVectors( self, inputFft ):
-        numberElements = self._arrayGeometry.NumberElements
-        numberDirections = len(self._outputBeams)
-        numberBins = inputFft.NumberBins
-        steeringVectors = np.empty( shape=(numberBins, numberElements, numberDirections),
-                                   dtype=np.complex )
+    def _computeSteeringVectors( self, binFrequencies ):
+        """
+        Computes a steering vector for each input frequency for every output beam this beamformer
+        is configured for.
+
+        The resulting 3D array of steering vectors is M x Q x N, where M is the number of
+        frequencies, Q is the number of beams, and N is the number of array elements. The way to
+        view this is that the mth slice is a set of Q steering vectors that steer the N elements of
+        the array in the directions of the corresponding beams.
+
+        Note that the steering vectors can consume A LOT of memory. Typically the frequency
+        dimension is the most dominant one. As such, one should be careful when picking how many
+        frequencies worth of steering vectors to compute.
+
+        """
+        # From Optimum Array Processing (p. 30), the steering vector (or array manifold vector) is
+        # a function of a directional wavenumber, i.e., a function of frequency and look direction
+        # (which in turn is defined by an azimuth phi and a polar angle theta). The steering vector
+        # v(k) = [exp(-j * (k . p1))  |  exp(-j * (k . p2))  | ...  |  exp(-j * (k . pN))].
+        #
+        # The Cartesian coordinate for each array element I is given by pI. The wavenumber k is
+        # given by k = -2 * pi * f / c * A, where f is the frequency of the plane wave corresponding
+        # to the computed steering vector and c is the speed at which the plane wave is propagating.
+        # A is a unit vector defined in terms of the spherical coordinates of the plane wave's
+        # source and is given by the following:
+        #
+        #     [ -sin(theta) * cos(phi)
+        #       -sin(theta) * sin(phi)
+        #       -cos(theta) ]
+        #
+        # The imaginary unit is given by j.
+        #
+        numberElements = self._NumberElements
+        numberBeams = self._NumberBeams
+        twoPiOverC = 2.0 * np.pi / self._speedOfSound
+
+        beamCartesian = (sphericalToUnitCartesian( beam.Azimuth, beam.PolarAngle ) \
+                         for beam in self._outputBeams)
+        beamCartesianFlat = itertools.chain.from_iterable( beamCartesian )
+
+        elementCartesian = zip( self._arrayGeometry.X,
+                               self._arrayGeometry.Y,
+                               self._arrayGeometry.Z )
+        elementCartesianFlat = itertools.chain.from_iterable( elementCartesian )
+
+        # NOTE: np.fromiter only works on 1D iterables to make 1D arrays, so we flatten our beam
+        # and element Cartesian coordinates to create the array and then reshape them respectively
+        # to the appropriate Q x 3 and N x 3 arrays.
+        return np.exp( 1j *
+                      np.einsum( 'm,qi,ni->mqn',
+                                twoPiOverC * binFrequencies,
+                                np.fromiter( beamCartesianFlat, np.float, numberBeams * 3 ).reshape( (numberBeams, 3) ),
+                                np.fromiter( elementCartesianFlat, np.float, numberElements * 3 ).reshape( (numberElements, 3) ) ) )
+
+def sphericalToUnitCartesian( azimuth, polar ):
+    polar = np.radians( polar )
+    azimuth = np.radians( azimuth )
+    sinPolar = np.sin( polar )
+    sinAzimuth = np.sin( azimuth )
+    cosPolar = np.cos( polar )
+    cosAzimuth = np.cos( azimuth )
+
+    return np.array( (sinPolar * cosAzimuth,
+                      sinPolar * sinAzimuth,
+                      cosPolar) )
 
 ## OUTPUT SETUP ##
 
@@ -1000,6 +1059,13 @@ arraySim.addTarget( Target( PositionAzEl( azimuth=-45.0 ),
                            soundPressureLevel=126,
                            signalGenerator=SineGenerator() ) )
 
+# Beam directions we care about.
+outputBeams = (Beam( 90.0 ),
+               Beam( 45.0 ),
+               Beam( 0.0 ),
+               Beam( -45.0 ),
+               Beam( -90.0 ))
+
 # Run the simulation.
 numberSnapshots = 30
 #arraySim.simulate( numberSnapshots, etsFileName )
@@ -1008,7 +1074,7 @@ numberSnapshots = 30
 transformer = FourierTransformer( window=HannWindow() )
 #transformer.transformTimeSeries( etsFileName, elementFftFileName )
 
-#b = Beamformer( geometry, [Beam( az, 0.0 ) for az in np.linspace( -90, 90, 100 )], 42, 1480.0 )
+beamformer = Beamformer( geometry, outputBeams, 2 * geometry.NumberElements, speedOfSound )
 #b.process( elementFftFileName, beamformedFftFileName )
 
 ## TESTING ##
