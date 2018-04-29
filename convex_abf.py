@@ -855,7 +855,9 @@ class Beamformer:
 
         # Keep processing until we have no more CSMs available for processing.
         snapshotsToKeep = 0
+        iSeq = -1
         while True:
+            iSeq += 1
             numberNewSnapshots = self._readNextSnapshots( inputFft, inputSnapshots, snapshotsToKeep )
             numberValidSnapshots = snapshotsToKeep + numberNewSnapshots
             numberAvailableCsms = numberValidSnapshots - self._snapshotAverageCount + 1
@@ -892,6 +894,7 @@ class Beamformer:
                 # (frequency, beam) combination.
                 for iBeam in range( numberBeams ):
                     currentSteeringVector = steeringVectors[iBin, iBeam, :]
+                    print( "Computing weights for Sequence = %d   Bin = %d   Beam = %d" % (iSeq+1, iBin+1, iBeam+1) )
                     currentWeights = computeWeightsCb( currentCsm, currentSteeringVector )
 
                     # Beamformer output is given by w*x, where w is the Nx1 vector of weights, and x
@@ -1076,6 +1079,28 @@ def computeWeightsConventional( csm, steeringVector ):
     # introduces a phase shift to maximize response in the corresponding direction of arrival (DOA).
     return np.copy( steeringVector )
 
+def computeWeightsCapon( csm, steeringVector ):
+    try:
+        import cvxpy as cvx
+    except ImportError:
+        print( ("Cannot compute Capon beamformer weights. CVXPY not available. Returning " +
+                "conventional weights.") )
+        return computeWeightsConventional( csm, steeringVector )
+    
+    # Reshape the steering vectors so that it's viewed as a 2D array. This just keeps things
+    # consistent in our model, where our weight vector is actually shaped like a 2D array.
+    # We'll be sure to unpack it after the optimization runs.
+    numberElements = steeringVector.size
+    steeringVector2D = steeringVector.reshape( (numberElements, 1) )
+    weights = cvx.Variable( (numberElements, 1), complex=True )
+    distortionlessResponseConstraint = [weights.H * steeringVector2D == 1.0]
+    minimizePowerObjective = cvx.Minimize( cvx.quad_form( weights, csm ) )
+    problem = cvx.Problem( minimizePowerObjective, distortionlessResponseConstraint )
+    problem.solve()
+    
+    # Unpack the weights into a 1D array.
+    return weights.value.reshape( numberElements )
+
 ## OUTPUT SETUP ##
 
 # Dump all output to a temp file location on the file system.
@@ -1083,7 +1108,8 @@ outputFolder = pathlib.Path( tempfile.gettempdir(), 'convexAbf' )
 outputFolder.mkdir( parents=True, exist_ok=True )
 etsFileName = str( outputFolder / 'array.ets' )
 elementFftFileName = str( outputFolder / 'element.fft' )
-beamformedFftFileName = str( outputFolder / 'beamformed.fft' )
+conventionalBeamformedFftFileName = str( outputFolder / 'conventionalBeamformed.fft' )
+caponBeamformedFftFileName = str( outputFolder / 'caponBeamformed.fft' )
 
 ##  ARRAY DESIGN ##
 speedOfSound = 1480.0
@@ -1164,7 +1190,8 @@ transformer.transformTimeSeries( etsFileName, elementFftFileName )
 
 print( "Forming output beams" )
 beamformer = Beamformer( geometry, outputBeams, 2 * geometry.NumberElements, speedOfSound )
-beamformer.process( elementFftFileName, beamformedFftFileName, computeWeightsConventional )
+beamformer.process( elementFftFileName, conventionalBeamformedFftFileName, computeWeightsConventional )
+beamformer.process( elementFftFileName, caponBeamformedFftFileName, computeWeightsCapon )
 
 ## TESTING ##
 import warnings
@@ -1243,13 +1270,39 @@ with FourierSpectra.open( elementFftFileName ) as fft:
         _ = ax[axRow, axCol].set_ylabel( 'Frequency (Hz)' )
         _ = ax[axRow, axCol].set_ylabel( 'Power (dB)' )
 
-with FourierSpectra.open( beamformedFftFileName ) as beamformedFft:
+with FourierSpectra.open( conventionalBeamformedFftFileName ) as beamformedFft:
     plotsPerRow = 2
     numberRows = int(np.ceil( beamformedFft.NumberChannels / plotsPerRow ))
     fig, ax = plt.subplots( numberRows, plotsPerRow,
                            figsize=(6 * plotsPerRow, numberRows * 3), dpi=90,
                            squeeze=False )
     fig.suptitle( 'Conventionally beamformed spectra for first simulated snapshot', y=1, fontsize=14 )
+    fig.tight_layout( pad=4, h_pad=2, w_pad=2 )
+
+    binFrequencies = beamformedFft.BinFrequencies
+    binFrequencies = binFrequencies[ binFrequencies < 250.0 ]
+    spectra = beamformedFft.readSnapshot()
+
+    for iChannel in range( beamformedFft.NumberChannels ):
+        axRow = int(iChannel / plotsPerRow)
+        axCol = int(iChannel - axRow * plotsPerRow)
+        channelPower = np.absolute( spectra[0:len(binFrequencies),iChannel] ) / beamformedFft.FftLength
+        channelDb = 10.0 * np.log10( channelPower )
+        normChannelPower = channelPower / np.max( channelPower )
+        normChannelDb = 10.0 * np.log10( normChannelPower )
+        _ = ax[axRow, axCol].plot( binFrequencies, channelDb )
+        _ = ax[axRow, axCol].set_title( 'Beam %d' % (iChannel + 1) )
+        _ = ax[axRow, axCol].grid( True, which='both' )
+        _ = ax[axRow, axCol].set_ylabel( 'Frequency (Hz)' )
+        _ = ax[axRow, axCol].set_ylabel( 'Power (dB)' )
+        
+with FourierSpectra.open( caponBeamformedFftFileName ) as beamformedFft:
+    plotsPerRow = 2
+    numberRows = int(np.ceil( beamformedFft.NumberChannels / plotsPerRow ))
+    fig, ax = plt.subplots( numberRows, plotsPerRow,
+                           figsize=(6 * plotsPerRow, numberRows * 3), dpi=90,
+                           squeeze=False )
+    fig.suptitle( 'Capon beamformed spectra for first simulated snapshot', y=1, fontsize=14 )
     fig.tight_layout( pad=4, h_pad=2, w_pad=2 )
 
     binFrequencies = beamformedFft.BinFrequencies
