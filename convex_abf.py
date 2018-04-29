@@ -829,15 +829,16 @@ class Beamformer:
     def _NumberBeams( self ):
         return len( self._outputBeams )
 
-    def process( self, inputFileName, outputFileName ):
+    def process( self, inputFileName, outputFileName, computeWeightsCb ):
         with FourierSpectra.open( inputFileName ) as inputFft, \
-            FourierSpectra.create( inputFft.FftLength, self._NumberDirections,
+            FourierSpectra.create( inputFft.FftLength, self._NumberBeams,
                                   inputFft.SamplingRate, outputFileName ) as outputFft:
             # Figure out which process method we're using.
             innerProcess, numberBufferedSnapshots = self._selectProcess( inputFft.NumberBins )
-            innerProcess( inputFft, outputFft, numberBufferedSnapshots )
+            innerProcess( inputFft, outputFft, numberBufferedSnapshots, computeWeightsCb )
 
-    def _precomputeProcess( self, inputFft, outputFft, numberBufferedSnapshots ):
+    def _precomputeProcess( self, inputFft, outputFft, numberBufferedSnapshots, computeWeightsCb ):
+        print( "Beamforming by precomputing all steering vectors" )
         numberBins = inputFft.NumberBins
         numberBeams = self._NumberBeams
         numberElements = self._NumberElements
@@ -852,8 +853,84 @@ class Beamformer:
         inputSnapshots = np.empty( shape=(numberBufferedSnapshots, numberBins, numberElements),
                                   dtype=np.complex )
 
-    def _amortizedProcess( self, inputFft, outputFft, numberBufferedSnapshots ):
+        # Keep processing until we have no more CSMs available for processing.
+        snapshotsToKeep = 0
+        while True:
+            numberNewSnapshots = self._readNextSnapshots( inputFft, inputSnapshots, snapshotsToKeep )
+            numberValidSnapshots = snapshotsToKeep + numberNewSnapshots
+            numberAvailableCsms = numberValidSnapshots - self._snapshotAverageCount + 1
+            if numberAvailableCsms <= 0:
+                break
+
+            # In this process, we buffer up enough snapshots to compute exactly 1 CSM.
+            assert numberAvailableCsms == 1
+            iCurrentCsm = 0
+            iCsmSnapshotSliceStart = iCurrentCsm
+            iCsmSnapshotSliceStop = iCsmSnapshotSliceStart + self._snapshotAverageCount
+            iCsmSnapshot = iCsmSnapshotSliceStop - 1
+            csmSnapshotSlice = slice( iCsmSnapshotSliceStart, iCsmSnapshotSliceStop )
+
+            # Compute the weights for each frequency we process.
+            for iBin in range( numberBins ):
+                # Form the cross-spectral matrix for this frequency bin.
+                #
+                # To form the CSM for the current frequency, we compute the XX*, where X is an
+                # N-by-J matrix containing the next J snapshots of spectral data for all N channels
+                # for the current frequency bin, and {.}* is the conjugate transpose.
+                #
+                # Note that our input FFT data has dimensionality of (snapshot, frequency, channel),
+                # and when we take the slice of our snapshot buffer corresponding to the matrix X,
+                # we end up with a J-by-N view of the snapshot data used to compute the current CSM.
+                # Our view needs to be transposed (but not conjugated) before multiplying, which is
+                # why it looks like we're computing X'conj(X) instead (where {.}' is the
+                # non-conjugate transpose).
+                currentCsmSnapshots = inputSnapshots[csmSnapshotSlice, iBin, :]
+                currentCsmSnapshot = inputSnapshots[iCsmSnapshot, iBin, :]
+                currentCsm = currentCsmSnapshots.T @ currentCsmSnapshots.conj()
+
+                # For each frequency, scan over all beams and compute a set of weights for each
+                # (frequency, beam) combination.
+                for iBeam in range( numberBeams ):
+                    currentSteeringVector = steeringVectors[iBin, iBeam, :]
+                    currentWeights = computeWeightsCb( currentCsm, currentSteeringVector )
+
+                    # Beamformer output is given by w*x, where w is the Nx1 vector of weights, and x
+                    # is the Nx1 vector containing the snapshot data for the current frequency bin.
+                    # https://www.acoustics.asn.au/conference_proceedings/AAS2005/papers/8.pdf
+                    outputSnapshot[iBin, iBeam] = np.dot( currentWeights.conj(), currentCsmSnapshot )
+
+            # Write out this snapshot and compute how many snapshots we will keep for the next
+            # iteration. Note that in this beamforming process, that number should be one less than
+            # the number we buffer.
+            outputFft.writeSnapshot( outputSnapshot )
+            snapshotsToKeep = numberValidSnapshots - numberAvailableCsms
+            assert snapshotsToKeep == (numberBufferedSnapshots - 1)
+
+    def _amortizedProcess( self, inputFft, outputFft, numberBufferedSnapshots, computeWeightsCb ):
         print( "Amortized" )
+
+    def _readNextSnapshots( self, inputFft, snapshotBuffer, snapshotsToKeep ):
+        numberBufferedSnapshots = snapshotBuffer.shape[0]
+        snapshotsToRead = numberBufferedSnapshots - snapshotsToKeep
+
+        if snapshotsToRead == 0 :
+            return 0
+
+        # Pack old snapshots that we're keeping to the front of the snapshot buffer. If we're not
+        # keeping any snapshots, then there's no need to shuffle since we're going to overwrite the
+        # entire snapshot buffer.
+        if snapshotsToKeep > 0:
+            snapshotBuffer[0:snapshotsToKeep, :] = snapshotBuffer[snapshotsToRead:, :]
+
+        numberNewSnapshots = 0
+        for iNewSnapshot in range( snapshotsToKeep, numberBufferedSnapshots ):
+            newSnapshot = inputFft.readSnapshot()
+            if newSnapshot.size == 0:
+                break
+            snapshotBuffer[iNewSnapshot, :] = newSnapshot
+            numberNewSnapshots += 1
+
+        return numberNewSnapshots
 
     def _selectProcess( self, numberBins ):
         """
@@ -994,6 +1071,11 @@ def sphericalToUnitCartesian( azimuth, polar ):
                       sinPolar * sinAzimuth,
                       cosPolar) )
 
+def computeWeightsConventional( csm, steeringVector ):
+    # Conventional beamforming has weights that are equal to the steering vector, which essentially
+    # introduces a phase shift to maximize response in the corresponding direction of arrival (DOA).
+    return np.copy( steeringVector )
+
 ## OUTPUT SETUP ##
 
 # Dump all output to a temp file location on the file system.
@@ -1061,21 +1143,28 @@ arraySim.addTarget( Target( PositionAzEl( azimuth=-45.0 ),
 
 # Beam directions we care about.
 outputBeams = (Beam( 90.0 ),
+               Beam( 60.0 ),
                Beam( 45.0 ),
+               Beam( 30.0 ),
                Beam( 0.0 ),
+               Beam( -30.0 ),
                Beam( -45.0 ),
+               Beam( -60.0 ),
                Beam( -90.0 ))
 
 # Run the simulation.
 numberSnapshots = 30
-#arraySim.simulate( numberSnapshots, etsFileName )
+print( "Simulating  time series" )
+arraySim.simulate( numberSnapshots, etsFileName )
 
 # Produce the Fourier spectra of our time series.
+print( "Computing spectral information" )
 transformer = FourierTransformer( window=HannWindow() )
-#transformer.transformTimeSeries( etsFileName, elementFftFileName )
+transformer.transformTimeSeries( etsFileName, elementFftFileName )
 
+print( "Forming output beams" )
 beamformer = Beamformer( geometry, outputBeams, 2 * geometry.NumberElements, speedOfSound )
-#b.process( elementFftFileName, beamformedFftFileName )
+beamformer.process( elementFftFileName, beamformedFftFileName, computeWeightsConventional )
 
 ## TESTING ##
 import warnings
@@ -1132,7 +1221,7 @@ with FourierSpectra.open( elementFftFileName ) as fft:
     plotsPerRow = 2
     numberRows = int(np.ceil( fft.NumberChannels / plotsPerRow ))
     fig, ax = plt.subplots( numberRows, plotsPerRow,
-                           figsize=(6 * plotsPerRow, numberRows * 1.5), dpi=90,
+                           figsize=(6 * plotsPerRow, numberRows * 3), dpi=90,
                            squeeze=False )
     fig.suptitle( 'Fourier spectra for first simulated snapshot', y=1, fontsize=14 )
     fig.tight_layout( pad=4, h_pad=2, w_pad=2 )
@@ -1145,9 +1234,40 @@ with FourierSpectra.open( elementFftFileName ) as fft:
         axRow = int(iChannel / plotsPerRow)
         axCol = int(iChannel - axRow * plotsPerRow)
         channelPower = np.absolute( spectra[0:len(binFrequencies),iChannel] ) / fft.FftLength
-        _ = ax[axRow, axCol].plot( binFrequencies, channelPower )
+        channelDb = 10.0 * np.log10( channelPower )
+        normChannelPower = channelPower / np.max( channelPower )
+        normChannelDb = 10.0 * np.log10( normChannelPower )
+        _ = ax[axRow, axCol].plot( binFrequencies, channelDb )
         _ = ax[axRow, axCol].set_title( 'Element %d' % (iChannel + 1) )
         _ = ax[axRow, axCol].grid( True, which='both' )
+        _ = ax[axRow, axCol].set_ylabel( 'Frequency (Hz)' )
+        _ = ax[axRow, axCol].set_ylabel( 'Power (dB)' )
+
+with FourierSpectra.open( beamformedFftFileName ) as beamformedFft:
+    plotsPerRow = 2
+    numberRows = int(np.ceil( beamformedFft.NumberChannels / plotsPerRow ))
+    fig, ax = plt.subplots( numberRows, plotsPerRow,
+                           figsize=(6 * plotsPerRow, numberRows * 3), dpi=90,
+                           squeeze=False )
+    fig.suptitle( 'Conventionally beamformed spectra for first simulated snapshot', y=1, fontsize=14 )
+    fig.tight_layout( pad=4, h_pad=2, w_pad=2 )
+
+    binFrequencies = beamformedFft.BinFrequencies
+    binFrequencies = binFrequencies[ binFrequencies < 250.0 ]
+    spectra = beamformedFft.readSnapshot()
+
+    for iChannel in range( beamformedFft.NumberChannels ):
+        axRow = int(iChannel / plotsPerRow)
+        axCol = int(iChannel - axRow * plotsPerRow)
+        channelPower = np.absolute( spectra[0:len(binFrequencies),iChannel] ) / beamformedFft.FftLength
+        channelDb = 10.0 * np.log10( channelPower )
+        normChannelPower = channelPower / np.max( channelPower )
+        normChannelDb = 10.0 * np.log10( normChannelPower )
+        _ = ax[axRow, axCol].plot( binFrequencies, channelDb )
+        _ = ax[axRow, axCol].set_title( 'Beam %d' % (iChannel + 1) )
+        _ = ax[axRow, axCol].grid( True, which='both' )
+        _ = ax[axRow, axCol].set_ylabel( 'Frequency (Hz)' )
+        _ = ax[axRow, axCol].set_ylabel( 'Power (dB)' )
 
 ## This test demonstrates how a denormal number time[5] fed into sig.sawtooth produces a NaN ##
 #snapshotStartTime = 0.0
