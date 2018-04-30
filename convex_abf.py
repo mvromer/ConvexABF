@@ -980,7 +980,8 @@ class Beamformer:
                 # non-conjugate transpose).
                 currentCsmSnapshots = inputSnapshots[csmSnapshotSlice, iInputBin, :]
                 currentCsmSnapshot = inputSnapshots[iCsmSnapshot, iInputBin, :]
-                currentCsm = currentCsmSnapshots.T @ currentCsmSnapshots.conj()
+                currentCsm = ((1.0/self._snapshotAverageCount) *
+                              (currentCsmSnapshots.T @ currentCsmSnapshots.conj()))
 
                 # For each frequency, scan over all beams and compute a set of weights for each
                 # (frequency, beam) combination.
@@ -1291,7 +1292,7 @@ outputBeams = (Beam( 90.0 ),
                Beam( -60.0 ),
                Beam( -90.0 ))
 
-frequencyBandToProcess = FrequencyBand( startHertz=50.0, stopHertz=500.0 )
+frequencyBandToProcess = FrequencyBand( startHertz=50.0, stopHertz=130.0 )
 
 # Run the simulation.
 numberSnapshots = 30
