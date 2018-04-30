@@ -1218,7 +1218,7 @@ def computeWeightsCapon( csm, steeringVector ):
 ## OUTPUT SETUP ##
 
 # Dump all output to a temp file location on the file system.
-outputFolder = pathlib.Path( tempfile.gettempdir(), 'convexAbf' )
+outputFolder = pathlib.Path( pathlib.Path.home(), 'convexAbf' )
 outputFolder.mkdir( parents=True, exist_ok=True )
 etsFileName = str( outputFolder / 'array.ets' )
 elementFftFileName = str( outputFolder / 'element.fft' )
