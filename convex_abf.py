@@ -813,78 +813,6 @@ class FrequencyBand:
 def elevationToPolarAngle( elevation ):
     return 90.0 - elevation
 
-class SlidingWindow:
-    @classmethod
-    def createWithAccumulator( cls, windowHalfWidth, initialBlocks, onSlideCb, createAccumulatorCb ):
-        assert createAccumulatorCb, "Callback for creating an accumulator must be provided."
-        window = cls( windowHalfWidth, initialBlocks, onSlideCb )
-        accumulator = createAccumulatorCb( window )
-        return (window, accumulator)
-
-    def __init__( self, windowHalfWidth, initialBlocks, onSlideCb ):
-        assert windowHalfWidth > 0
-        self._windowWidth = 2 * windowHalfWidth + 1
-
-        assert initialBlocks is not None
-        numberInitialBlocks = initialBlocks.shape[0]
-        assert initialBlocks.ndim > 1, "Initial blocks must be given as an N-D array with N > 1."
-        assert numberInitialBlocks <= self._windowWidth, \
-            "Number of initial blocks must be less than or equal to window width %d" % self._windowWidth
-
-        # Initialize the window with the initial blocks we were given, zeroing out the remainder of
-        # the blocks.
-        iFirstInitialBlock = self._windowWidth - numberInitialBlocks
-        self.BlockShape = initialBlocks.shape[1:]
-        self.Window = np.empty( (self._windowWidth,) + self.BlockShape )
-        self.Window[0:iFirstInitialBlock, :] = np.zeros( self.BlockShape )
-        self.Window[iFirstInitialBlock:, :] = initialBlocks
-
-        self._iFirst = 0
-        self._iCurrent = windowHalfWidth
-        self._iLast = self._windowWidth - 1
-        self._onSlide = onSlideCb
-
-    @property
-    def FirstBlock( self ):
-        return self.Window[self._iFirst, :]
-
-    @property
-    def CurrentBlock( self ):
-        return self.Window[self._iCurrent, :]
-
-    @property
-    def LastBlock( self ):
-        return self.Window[self._iLast, :]
-
-    def slideWindow( self, accumulator, newBlock=None ):
-        if newBlock is not None:
-            assert newBlock.shape == self.BlockShape, "Input block must have shape %s" % self.BlockShape
-        assert self._iCurrent != self._iLast, "Cannot slide window past last block stored."
-
-        # Callback so that callers have a chance to update the accumulator.
-        if self._onSlide:
-            self._onSlide( self, newBlock, accumulator )
-
-        # Slide the first and current block indices forward.
-        self._iFirst = self._advanceIndex( self._iFirst )
-        self._iCurrent = self._advanceIndex( self._iCurrent )
-
-        if newBlock is not None:
-            # Slide the last index forward and write the new block to the new end of our window.
-            self._iLast = self._advanceIndex( self._iLast )
-            self.Window[self._iLast, :] = newBlock
-
-    def _advanceIndex( self, index ):
-        return (index + 1) % self._windowWidth
-
-def createRunningSum( slidingWindow ):
-    return np.sum( slidingWindow.Window, axis=0 )
-
-def updateRunningSum( slidingWindow, newBlock, runningSum ):
-    runningSum -= slidingWindow.FirstBlock
-    if newBlock is not None:
-        runningSum += newBlock
-
 class Beamformer:
     def __init__( self, arrayGeometry, outputBeams, bandToProcess, snapshotAverageCount,
                  speedOfSound, memoryBudgetMB = 1024 ):
@@ -918,100 +846,10 @@ class Beamformer:
             with FourierSpectra.create( inputFft.FftLength, inputFft.SamplingRate,
                                        self._NumberBeams, numberBins, binFrequencies,
                                        outputFileName ) as outputFft:
-                # Figure out which process method we're using.
-                # innerProcess, numberBufferedSnapshots = self._selectProcess( numberBins )
-                #
-                # NOTE: For now we're going to hard code for the precompute process until other
-                # changes to the core beamformer (e.g., multiprocessing support) are finished.
-                #innerProcess, numberBufferedSnapshots = (self._precomputeProcess,
-                #                                         self._snapshotAverageCount)
-                innerProcess, numberBufferedSnapshots = (self._multiprocessProcess, self._snapshotAverageCount)
-                innerProcess( inputFft, outputFft, numberBufferedSnapshots, iStartBin, iStopBin,
-                             computeWeightsCb )
+                self._innerProcess( inputFft, outputFft, iStartBin, iStopBin, computeWeightsCb )
 
-    def _precomputeProcess( self, inputFft, outputFft, numberBufferedSnapshots, iStartBin, iStopBin,
-                           computeWeightsCb ):
-        print( "Beamforming by precomputing all steering vectors" )
-        numberInputBins = inputFft.NumberBins
-        numberOutputBins = iStopBin - iStartBin
-        numberBeams = self._NumberBeams
-        numberElements = self._NumberElements
-
-        # First precompute all of our steering vectors that we will use.
-        steeringVectors = self._computeSteeringVectors( inputFft.BinFrequencies[iStartBin:iStopBin] )
-
-        # Allocate the output snapshot.
-        outputSnapshot = np.empty( shape=(numberOutputBins, numberBeams), dtype=np.complex )
-
-        # Allocate the input snapshot buffer.
-        inputSnapshots = np.empty( shape=(numberBufferedSnapshots, numberInputBins, numberElements),
-                                  dtype=np.complex )
-
-        # Keep processing until we have no more CSMs available for processing.
-        snapshotsToKeep = 0
-        iOutputSnapshot = 0
-        while True:
-            numberNewSnapshots = self._readNextSnapshots( inputFft, inputSnapshots, snapshotsToKeep )
-            numberValidSnapshots = snapshotsToKeep + numberNewSnapshots
-            numberAvailableCsms = numberValidSnapshots - self._snapshotAverageCount + 1
-            if numberAvailableCsms <= 0:
-                break
-
-            # In this process, we buffer up enough snapshots to compute exactly 1 CSM.
-            assert numberAvailableCsms == 1
-            iCurrentCsm = 0
-            iCsmSnapshotSliceStart = iCurrentCsm
-            iCsmSnapshotSliceStop = iCsmSnapshotSliceStart + self._snapshotAverageCount
-            iCsmSnapshot = iCsmSnapshotSliceStop - 1
-            csmSnapshotSlice = slice( iCsmSnapshotSliceStart, iCsmSnapshotSliceStop )
-
-            # Compute the weights for each frequency we process.
-            print( "Computing weights for output snapshot %d" % (iOutputSnapshot+1) )
-            for iInputBin in range( iStartBin, iStopBin ):
-                iOutputBin = iInputBin - iStartBin
-                print( "\tProcessing frequency %g Hz (bin %d)" %
-                      (inputFft.BinFrequencies[iInputBin], iInputBin) )
-
-                # Form the cross-spectral matrix for this frequency bin.
-                #
-                # To form the CSM for the current frequency, we compute the XX*, where X is an
-                # N-by-J matrix containing the next J snapshots of spectral data for all N channels
-                # for the current frequency bin, and {.}* is the conjugate transpose.
-                #
-                # Note that our input FFT data has dimensionality of (snapshot, frequency, channel),
-                # and when we take the slice of our snapshot buffer corresponding to the matrix X,
-                # we end up with a J-by-N view of the snapshot data used to compute the current CSM.
-                # Our view needs to be transposed (but not conjugated) before multiplying, which is
-                # why it looks like we're computing X'conj(X) instead (where {.}' is the
-                # non-conjugate transpose).
-                currentCsmSnapshots = inputSnapshots[csmSnapshotSlice, iInputBin, :]
-                currentCsmSnapshot = inputSnapshots[iCsmSnapshot, iInputBin, :]
-                currentCsm = ((1.0/self._snapshotAverageCount) *
-                              (currentCsmSnapshots.T @ currentCsmSnapshots.conj()))
-
-                # For each frequency, scan over all beams and compute a set of weights for each
-                # (frequency, beam) combination.
-                for iBeam in range( numberBeams ):
-                    currentSteeringVector = steeringVectors[iOutputBin, iBeam, :]
-                    currentWeights = computeWeightsCb( currentCsm, currentSteeringVector )
-
-                    # Beamformer output is given by w*x, where w is the Nx1 vector of weights, and x
-                    # is the Nx1 vector containing the snapshot data for the current frequency bin.
-                    # https://www.acoustics.asn.au/conference_proceedings/AAS2005/papers/8.pdf
-                    outputSnapshot[iOutputBin, iBeam] = np.dot( currentWeights.conj(),
-                                                              currentCsmSnapshot )
-
-            # Write out this snapshot and compute how many snapshots we will keep for the next
-            # iteration. Note that in this beamforming process, that number should be one less than
-            # the number we buffer.
-            outputFft.writeSnapshot( outputSnapshot )
-            iOutputSnapshot += 1
-            snapshotsToKeep = numberValidSnapshots - numberAvailableCsms
-            assert snapshotsToKeep == (numberBufferedSnapshots - 1)
-
-    def _multiprocessProcess( self, inputFft, outputFft, numberBufferedSnapshots, iStartBin,
-                             iStopBin, computeWeightsCb ):
-        print( "Beamforming by using multiprocessing" )
+    def _innerProcess( self, inputFft, outputFft, iStartBin, iStopBin, computeWeightsCb ):
+        numberBufferedSnapshots = self._snapshotAverageCount
         numberInputBins = inputFft.NumberBins
         numberOutputBins = iStopBin - iStartBin
         numberBeams = self._NumberBeams
@@ -1041,7 +879,7 @@ class Beamformer:
                 if numberAvailableCsms <= 0:
                     break
 
-                # In this process, we still buffer up enough snapshots to compute exactly 1 CSM.
+                # We buffer up enough snapshots to compute exactly 1 CSM.
                 assert numberAvailableCsms == 1
                 iCurrentCsm = 0
                 iCsmSnapshotSliceStart = iCurrentCsm
@@ -1064,11 +902,9 @@ class Beamformer:
                 for iInputBin in range( iStartBin, iStopBin ):
                     iOutputBin = iInputBin - iStartBin
                     currentCsmSnapshot = inputSnapshots[iCsmSnapshot, iInputBin, :]
-                    # Beamformer output is given by w*x, where w is the Nx1 vector of weights, and x
-                    # is the Nx1 vector containing the snapshot data for the current frequency bin.
-                    #
-                    # Since we currently have all weights for all output beams, we compute the
-                    # beamformer output for each output beam.
+                    # Beamformer output for a single (frequency, beam) pair is given by w*x, where w
+                    # is the Nx1 vector of weights computed for that (frequency, beam), and x is the
+                    # Nx1 vector containing the snapshot spectral data for that frequency's bin.
                     #
                     # https://www.acoustics.asn.au/conference_proceedings/AAS2005/papers/8.pdf
                     #
@@ -1076,8 +912,9 @@ class Beamformer:
                                   lambda binWeights: np.dot( binWeights.conj(), currentCsmSnapshot ),
                                   axis=1, arr=weights[iOutputBin] )
 
-                    # Alternate implementation using einsum. This may be faster, but we use the above to
-                    # match the output of the _precomputeProcess.
+                    # Alternate implementation using einsum. This may be faster, but we use the
+                    # above to match the output of the _precomputeProcess that we had in a previous
+                    # commit.
                     #
                     #outputSnapshot[iOutputBin, :] = np.einsum( "ij,j->i",
                     #                                          currentWeights.conj(),
@@ -1085,8 +922,7 @@ class Beamformer:
 
 
                 # Write out this snapshot and compute how many snapshots we will keep for the next
-                # iteration. Note that in this beamforming process, that number should be one less than
-                # the number we buffer.
+                # iteration. Note that number should be one less than the number we buffer.
                 outputFft.writeSnapshot( outputSnapshot )
                 iOutputSnapshot += 1
                 snapshotsToKeep = numberValidSnapshots - numberAvailableCsms
@@ -1118,10 +954,6 @@ class Beamformer:
             outputWeights[iBeam, :] = computeWeightsCb( csm, currentSteeringVector )
 
         return outputWeights
-
-    def _amortizedProcess( self, inputFft, outputFft, numberBufferedSnapshots, iStartBin, iStopBin,
-                          computeWeightsCb ):
-        print( "Amortized" )
 
     def _getBinIndicesToProcess( self, binFrequencies ):
         startHertz = self._bandToProcess.StartHertz
@@ -1164,79 +996,6 @@ class Beamformer:
             numberNewSnapshots += 1
 
         return numberNewSnapshots
-
-    def _selectProcess( self, numberBins ):
-        """
-        Determines whether to process the input snapshots using a total precomputation strategy
-        that avoids recomputation of steering vectors at the expense of memory or an amortized
-        recompute strategy that attempts to minimize the number of times steering vectors are
-        recomputed by maximizing the number of input snapshots that are buffered subject to a
-        (hard) minimum snapshot threshold and a (soft) memory budget. Returns the method that
-        implements the selected strategy as well as the number of input snapshots to read and
-        buffer at a time.
-
-        The motivation for this is that broadband beamforming where we take an FFT of a signal and
-        perform narrowband beamforming on the individual frequency components is both memory and
-        compute bound, but the former will be a far greater limiting factor.
-
-        To illustrate, let N be the number of input elements, M the number of frequency bins, Q the
-        number of output beams, and J the number of snapshots we need to average to build our CSM.
-        In order to keep our beamformer output within 3 dB of the optimal SINR, the snapshot average
-        count used for computing the cross spectral matrix SHOULD have been set to at least twice
-        the number of array elements, but if analyst wants to break that design rule, we don't do
-        anything to prevent that.
-
-        Consider that to compute the weights for a single frequency for a single output beam, we
-        need NQ + MNJ + MQ many complex values stored in memory. For the next beam or frequency
-        beam, we need to recompute the NQ many steering vectors. Thus for one output snapshot,
-        there are M many steering vector calculations that must be constantly recomputed every
-        snapshot.
-
-        Alternatively, we can precompute the steering vectors upfront and reuse them when computing
-        the weights for each snapshot. However, this requires MNQ + MNJ + MQ many complex values in
-        memory. Consider a 21 element array steered in 100 different directions with sampled time
-        series spanning a 4 Khz bandwidth. If the frequency domain spectrum for this time series has
-        0.1 Hz bin resolution, we have at least 40,001 bins. Thus the broadband beamformer requires
-        almost 1.9 GB of memory (assuming each complex value comprises two 64-bit doubles).
-
-        It is obvious there's a tension between being memory efficient and being compute efficient.
-        We note that if we read and buffer J' snapshots (J' > J), we can begin to amortize the cost
-        of recomputing steering vectors. This is because for each block of J' snapshots we read in,
-        we can compute the steering vector for a single (frequency, beam) pair and use it to
-        calculate the corresponding weights for J' - J output snapshots before needing to recompute
-        the steering vector for either the next beam or next frequency.
-
-        This strategy requires storing NQ + MNJ' + MQ(J' - J + 1) complex values in memory. The
-        breakeven point is the largest value of J' that results in less memory consumption than
-        the full precomputation method. However, rarely do we want to choose this for J'; othewise,
-        we gain no benefit since we will consume the same order of memory for a more computationally
-        expensive process. Instead we may constrain J' to be no larger than some memory budget
-        that's less than the amount needed for the full precomputation method. Given this memory
-        budget, the value for J' is readily solved.
-
-        """
-        # First see if the full precompute method uses the same or less memory than the memory
-        # budget. If so, then there's no need for the more complicated amortized method.
-        complexItemSize = float( np.dtype( np.complex ).itemsize )
-        numberElements = self._NumberElements
-        numberBeams = self._NumberBeams
-        precomputeMemoryMB = ((numberBins * numberElements * numberBeams) +
-                              (numberBins * numberElements * self._snapshotAverageCount) +
-                              (numberBins * numberBeams)) * complexItemSize / 1024**2
-
-        if precomputeMemoryMB <= self._memoryBudgetMB:
-            return (self._precomputeProcess, self._snapshotAverageCount)
-
-        numberBufferedSnapshots = np.floor( ((self._memoryBudgetMB * 1024**2 / complexItemSize) -
-                                             numberElements * numberBeams +
-                                             numberBins * numberBeams * self._snapshotAverageCount -
-                                             numberBins * numberBeams) /
-                                            (numberBins * numberElements +
-                                             numberBins * numberBeams) ).astype( int )
-
-        # We need to buffer at least our snapshot average count.
-        numberBufferedSnapshots = np.maximum( self._snapshotAverageCount, numberBufferedSnapshots )
-        return (self._amortizedProcess, numberBufferedSnapshots)
 
     def _computeSteeringVectors( self, binFrequencies ):
         """
@@ -1330,6 +1089,78 @@ def computeWeightsCapon( csm, steeringVector ):
 
     # Unpack the weights into a 1D array.
     return weights.value.reshape( numberElements )
+
+class SlidingWindow:
+    @classmethod
+    def createWithAccumulator( cls, windowHalfWidth, initialBlocks, onSlideCb, createAccumulatorCb ):
+        assert createAccumulatorCb, "Callback for creating an accumulator must be provided."
+        window = cls( windowHalfWidth, initialBlocks, onSlideCb )
+        accumulator = createAccumulatorCb( window )
+        return (window, accumulator)
+
+    def __init__( self, windowHalfWidth, initialBlocks, onSlideCb ):
+        assert windowHalfWidth > 0
+        self._windowWidth = 2 * windowHalfWidth + 1
+
+        assert initialBlocks is not None
+        numberInitialBlocks = initialBlocks.shape[0]
+        assert initialBlocks.ndim > 1, "Initial blocks must be given as an N-D array with N > 1."
+        assert numberInitialBlocks <= self._windowWidth, \
+            "Number of initial blocks must be less than or equal to window width %d" % self._windowWidth
+
+        # Initialize the window with the initial blocks we were given, zeroing out the remainder of
+        # the blocks.
+        iFirstInitialBlock = self._windowWidth - numberInitialBlocks
+        self.BlockShape = initialBlocks.shape[1:]
+        self.Window = np.empty( (self._windowWidth,) + self.BlockShape )
+        self.Window[0:iFirstInitialBlock, :] = np.zeros( self.BlockShape )
+        self.Window[iFirstInitialBlock:, :] = initialBlocks
+
+        self._iFirst = 0
+        self._iCurrent = windowHalfWidth
+        self._iLast = self._windowWidth - 1
+        self._onSlide = onSlideCb
+
+    @property
+    def FirstBlock( self ):
+        return self.Window[self._iFirst, :]
+
+    @property
+    def CurrentBlock( self ):
+        return self.Window[self._iCurrent, :]
+
+    @property
+    def LastBlock( self ):
+        return self.Window[self._iLast, :]
+
+    def slideWindow( self, accumulator, newBlock=None ):
+        if newBlock is not None:
+            assert newBlock.shape == self.BlockShape, "Input block must have shape %s" % self.BlockShape
+        assert self._iCurrent != self._iLast, "Cannot slide window past last block stored."
+
+        # Callback so that callers have a chance to update the accumulator.
+        if self._onSlide:
+            self._onSlide( self, newBlock, accumulator )
+
+        # Slide the first and current block indices forward.
+        self._iFirst = self._advanceIndex( self._iFirst )
+        self._iCurrent = self._advanceIndex( self._iCurrent )
+
+        if newBlock is not None:
+            # Slide the last index forward and write the new block to the new end of our window.
+            self._iLast = self._advanceIndex( self._iLast )
+            self.Window[self._iLast, :] = newBlock
+
+    def _advanceIndex( self, index ):
+        return (index + 1) % self._windowWidth
+
+def createRunningSum( slidingWindow ):
+    return np.sum( slidingWindow.Window, axis=0 )
+
+def updateRunningSum( slidingWindow, newBlock, runningSum ):
+    runningSum -= slidingWindow.FirstBlock
+    if newBlock is not None:
+        runningSum += newBlock
 
 ## OUTPUT SETUP ##
 
