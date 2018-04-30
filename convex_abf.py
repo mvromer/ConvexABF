@@ -919,7 +919,12 @@ class Beamformer:
                                        self._NumberBeams, numberBins, binFrequencies,
                                        outputFileName ) as outputFft:
                 # Figure out which process method we're using.
-                innerProcess, numberBufferedSnapshots = self._selectProcess( numberBins )
+                # innerProcess, numberBufferedSnapshots = self._selectProcess( numberBins )
+                #
+                # NOTE: For now we're going to hard code for the precompute process until other
+                # changes to the core beamformer (e.g., multiprocessing support) are finished.
+                innerProcess, numberBufferedSnapshots = (self._precomputeProcess,
+                                                         self._snapshotAverageCount)
                 innerProcess( inputFft, outputFft, numberBufferedSnapshots, iStartBin, iStopBin,
                              computeWeightsCb )
 
