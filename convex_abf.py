@@ -149,21 +149,30 @@ class FourierSpectra:
     formed by a beamformer, both generically referred to as channels.
 
     The Fourier spectrum data file contains a global header plus zero or more snapshots of spectral
-    data. Each snapshot contains M frequency bins by N channels many complex128 values. The value
-    M is the integer given by floor( FftLength / 2 ) + 1.
+    data. Each snapshot contains M frequency bins by N channels many complex128 values. If the value
+    M is zero in the global header, then a full-band FFT is assumed, in which case the number of
+    bins is the integer given by floor( FftLength / 2 ) + 1.
 
     The global header contains the following values in order:
         FftLength      (64-bit unsigned int)
-        NumberChannels (64-bit unsigned int)
         SamplingRate   (64-bit floating point)
+        NumberChannels (64-bit unsigned int)
+        NumberBins     (64-bit unsigned int)
+        BinFrequencies (NumberBins many 64-bit floating point values)
 
     """
     MODE_READ = 0
     MODE_WRITE = 1
 
     @classmethod
-    def create( cls, fftLength, numberChannels, samplingRate, dataFileName ):
-        return cls( dataFileName, cls.MODE_WRITE, fftLength, numberChannels, samplingRate )
+    def createFullBand( cls, fftLength, samplingRate, numberChannels, dataFileName ):
+        return cls( dataFileName, cls.MODE_WRITE, fftLength, samplingRate, numberChannels )
+
+    @classmethod
+    def create( cls, fftLength, samplingRate, numberChannels, numberBins, binFrequencies,
+               dataFileName ):
+        return cls( dataFileName, cls.MODE_WRITE, fftLength, samplingRate, numberChannels,
+                   numberBins, binFrequencies )
 
     @classmethod
     def open( cls, dataFileName ):
@@ -190,10 +199,22 @@ class FourierSpectra:
     def _readHeader( self ):
         self.FftLength = self._readFieldFromFile( self.FftLengthHeaderFormat,
                                                  self.FftLengthHeaderSize )
-        self.NumberChannels = self._readFieldFromFile( self.NumberChannelsHeaderFormat,
-                                                      self.NumberChannelsHeaderSize )
         self.SamplingRate = self._readFieldFromFile( self.SamplingRateHeaderFormat,
                                                    self.SamplingRateHeaderSize )
+        self.NumberChannels = self._readFieldFromFile( self.NumberChannelsHeaderFormat,
+                                                      self.NumberChannelsHeaderSize )
+        self.NumberBins = self._readFieldFromFile( self.NumberBinsHeaderFormat,
+                                                  self.NumberBinsHeaderSize )
+
+        if self.NumberBins:
+            self._isFullBand = False
+            self.BinFrequencies = np.fromfile( self._dataFile, self.BinFrequencyDataType,
+                                              self.NumberBins )
+        else:
+            self._isFullBand = True
+            self.NumberBins = self._computeFullBandNumberBins( self.FftLength )
+            self.BinFrequencies = self._computeFullBandBinFrequencies( self.SamplingRate,
+                                                                      self.FftLength )
 
     def _readFieldFromFile( self, fieldFormat, fieldSizeBytes ):
         # Note: struct.unpack returns a tuple even if there's only a single element.
@@ -201,43 +222,83 @@ class FourierSpectra:
 
     def _writeHeader( self ):
         self._writeFieldToFile( self.FftLength, self.FftLengthHeaderFormat )
-        self._writeFieldToFile( self.NumberChannels, self.NumberChannelsHeaderFormat )
         self._writeFieldToFile( self.SamplingRate, self.SamplingRateHeaderFormat )
+        self._writeFieldToFile( self.NumberChannels, self.NumberChannelsHeaderFormat )
+        self._writeFieldToFile( 0 if self._isFullBand else self.NumberBins,
+                               self.NumberBinsHeaderFormat )
+
+        if not self._isFullBand:
+            self._dataFile.write( self.BinFrequencies.tobytes() )
 
     def _writeFieldToFile( self, fieldValue, fieldFormat ):
         self._dataFile.write( struct.pack( fieldFormat, fieldValue ) )
 
-    def __init__( self, dataFileName, mode, fftLength=None, numberChannels=None, samplingRate=None ):
+    def __init__( self, dataFileName, mode, fftLength=None, samplingRate=None, numberChannels=None,
+                 numberBins=None, binFrequencies=None ):
+        # We currently don't know if we're a full-band FFT or not.
+        isFullBand = None
+
+        # Other computed properties we won't know off the bat.
+        binResolution = None
+
         assert mode in (self.MODE_READ, self.MODE_WRITE)
         assert dataFileName
 
         if mode == self.MODE_WRITE:
             assert fftLength > 0 and type(fftLength) is int, \
                 "FFT length must be positive integer."
+            assert samplingRate > 0, "Sampling rate must be positive."
             assert numberChannels > 0 and type(numberChannels) is int, \
                 "Number of channels must be positive integer."
-            assert samplingRate > 0, "Sampling rate must be positive."
+
+            binResolution = self._computeBinResolution( samplingRate, fftLength )
+
+            if numberBins:
+                assert numberBins > 0 and type(numberBins) is int, \
+                    "Number of bins must be positive integer."
+
+                maxNumberBins = self._computeFullBandNumberBins( fftLength )
+                assert numberBins <= maxNumberBins, \
+                    "Number of bins cannot exceed %d for FFT with length %d." % (maxNumberBins, fftLength)
+
+                assert binFrequencies is not None, \
+                    "Bin frequencies must be provided if number bins is given."
+                assert binFrequencies.size == numberBins, \
+                    "Number of bin frequencies must match number of bins."
+
+                isFullBand = False
+            else:
+                assert binFrequencies is None, \
+                    "Bin frequencies must NOT be provided if number of bins is not given."
+                numberBins = self._computeFullBandNumberBins( fftLength )
+                binFrequencies = self._computeFullBandBinFrequencies( samplingRate, fftLength )
+                isFullBand = True
 
         self._dataFileName = dataFileName
         self._dataFile = None
         self._mode = mode
         self.FftLength = fftLength
-        self.NumberChannels = numberChannels
         self.SamplingRate = samplingRate
+        self.NumberChannels = numberChannels
+        self.NumberBins = numberBins
+        self.BinFrequencies = binFrequencies
+        self.BinResolution = binResolution
+        self._isFullBand = isFullBand
         self._binDtype = np.dtype( np.complex128 )
 
-    @property
-    def NumberBins( self ):
-        return int(np.floor( self.FftLength / 2 ) + 1) if self.FftLength else None
+    @staticmethod
+    def _computeBinResolution( samplingRate, fftLength ):
+        return samplingRate / fftLength
 
-    @property
-    def BinResolution( self ):
-        return self.SamplingRate / self.FftLength
+    @staticmethod
+    def _computeFullBandNumberBins( fftLength ):
+        return int(np.floor( fftLength / 2 ) + 1)
 
-    @property
-    def BinFrequencies( self ):
-        numberBins = self.NumberBins
-        return np.arange( numberBins ) * self.BinResolution if numberBins else np.array( [] )
+    @staticmethod
+    def _computeFullBandBinFrequencies( samplingRate, fftLength ):
+        numberBins = FourierSpectra._computeFullBandNumberBins( fftLength )
+        binResolution = FourierSpectra._computeBinResolution( samplingRate, fftLength )
+        return np.arange( numberBins ) * binResolution
 
     def __enter__( self ):
         fileMode = "rb" if self._mode == self.MODE_READ else "wb"
@@ -254,13 +315,17 @@ class FourierSpectra:
         self._dataFile.close()
 
     # File format constants
+    BinFrequencyDataType = np.dtype( float )
+
     FftLengthHeaderSize = 8
-    NumberChannelsHeaderSize = 8
     SamplingRateHeaderSize = 8
+    NumberChannelsHeaderSize = 8
+    NumberBinsHeaderSize = 8
 
     FftLengthHeaderFormat = "=Q"
-    NumberChannelsHeaderFormat = "=Q"
     SamplingRateHeaderFormat = "=d"
+    NumberChannelsHeaderFormat = "=Q"
+    NumberBinsHeaderFormat = "=Q"
 
 class ArrayGeometry:
     @classmethod
@@ -607,7 +672,8 @@ class FourierTransformer:
             numberChannels = inputEts.NumberElements
             samplingRate = inputEts.SamplingRate
 
-            with FourierSpectra.create( fftLength, numberChannels, samplingRate, fftFileName ) as outputFft:
+            with FourierSpectra.createFullBand( fftLength, samplingRate, numberChannels,
+                                               fftFileName ) as outputFft:
                 # We maintain three FFT buffers during the transform. The first one is the buffer we
                 # will actually window and transform. The second and third ones together will
                 # contain the two most recently read snapshots of element time series data.
@@ -735,6 +801,15 @@ class Beam:
     def PolarAngle( self ):
         return elevationToPolarAngle( self.Elevation )
 
+class FrequencyBand:
+    def __init__( self, startHertz = -np.inf, stopHertz = np.inf ):
+        assert startHertz == -np.inf or startHertz >= 0.0, \
+            "Band start must be -INF or non-negative finite."
+        assert stopHertz > 0.0, "Band stop must be positive."
+        assert stopHertz > startHertz, "Band stop must be greater than band start."
+        self.StartHertz = startHertz
+        self.StopHertz = stopHertz
+
 def elevationToPolarAngle( elevation ):
     return 90.0 - elevation
 
@@ -811,12 +886,13 @@ def updateRunningSum( slidingWindow, newBlock, runningSum ):
         runningSum += newBlock
 
 class Beamformer:
-    def __init__( self, arrayGeometry, outputBeams, snapshotAverageCount, speedOfSound,
-                 memoryBudgetMB = 1024 ):
+    def __init__( self, arrayGeometry, outputBeams, bandToProcess, snapshotAverageCount,
+                 speedOfSound, memoryBudgetMB = 1024 ):
         assert snapshotAverageCount > 0
 
         self._arrayGeometry = arrayGeometry
         self._outputBeams = outputBeams
+        self._bandToProcess = bandToProcess
         self._snapshotAverageCount = snapshotAverageCount
         self._speedOfSound = speedOfSound
         self._memoryBudgetMB = memoryBudgetMB
@@ -830,34 +906,45 @@ class Beamformer:
         return len( self._outputBeams )
 
     def process( self, inputFileName, outputFileName, computeWeightsCb ):
-        with FourierSpectra.open( inputFileName ) as inputFft, \
-            FourierSpectra.create( inputFft.FftLength, self._NumberBeams,
-                                  inputFft.SamplingRate, outputFileName ) as outputFft:
-            # Figure out which process method we're using.
-            innerProcess, numberBufferedSnapshots = self._selectProcess( inputFft.NumberBins )
-            innerProcess( inputFft, outputFft, numberBufferedSnapshots, computeWeightsCb )
+        with FourierSpectra.open( inputFileName ) as inputFft:
+            # Figure out the frequency band we're going to process.
+            iStartBin, iStopBin = self._getBinIndicesToProcess( inputFft.BinFrequencies )
+            numberBins = iStopBin - iStartBin
+            binFrequencies = inputFft.BinFrequencies[iStartBin:iStopBin]
+            print( "Beamforming frequency band from %g Hz to %g Hz." %
+                  (binFrequencies[0], binFrequencies[-1]) )
+            print( "Averaging %d snapshots per CSM." % self._snapshotAverageCount )
 
-    def _precomputeProcess( self, inputFft, outputFft, numberBufferedSnapshots, computeWeightsCb ):
+            with FourierSpectra.create( inputFft.FftLength, inputFft.SamplingRate,
+                                       self._NumberBeams, numberBins, binFrequencies,
+                                       outputFileName ) as outputFft:
+                # Figure out which process method we're using.
+                innerProcess, numberBufferedSnapshots = self._selectProcess( numberBins )
+                innerProcess( inputFft, outputFft, numberBufferedSnapshots, iStartBin, iStopBin,
+                             computeWeightsCb )
+
+    def _precomputeProcess( self, inputFft, outputFft, numberBufferedSnapshots, iStartBin, iStopBin,
+                           computeWeightsCb ):
         print( "Beamforming by precomputing all steering vectors" )
-        numberBins = inputFft.NumberBins
+        numberInputBins = inputFft.NumberBins
+        numberOutputBins = iStopBin - iStartBin
         numberBeams = self._NumberBeams
         numberElements = self._NumberElements
 
         # First precompute all of our steering vectors that we will use.
-        steeringVectors = self._computeSteeringVectors( inputFft.BinFrequencies )
+        steeringVectors = self._computeSteeringVectors( inputFft.BinFrequencies[iStartBin:iStopBin] )
 
         # Allocate the output snapshot.
-        outputSnapshot = np.empty( shape=(numberBins, numberBeams), dtype=np.complex )
+        outputSnapshot = np.empty( shape=(numberOutputBins, numberBeams), dtype=np.complex )
 
         # Allocate the input snapshot buffer.
-        inputSnapshots = np.empty( shape=(numberBufferedSnapshots, numberBins, numberElements),
+        inputSnapshots = np.empty( shape=(numberBufferedSnapshots, numberInputBins, numberElements),
                                   dtype=np.complex )
 
         # Keep processing until we have no more CSMs available for processing.
         snapshotsToKeep = 0
-        iSeq = -1
+        iOutputSnapshot = 0
         while True:
-            iSeq += 1
             numberNewSnapshots = self._readNextSnapshots( inputFft, inputSnapshots, snapshotsToKeep )
             numberValidSnapshots = snapshotsToKeep + numberNewSnapshots
             numberAvailableCsms = numberValidSnapshots - self._snapshotAverageCount + 1
@@ -873,7 +960,12 @@ class Beamformer:
             csmSnapshotSlice = slice( iCsmSnapshotSliceStart, iCsmSnapshotSliceStop )
 
             # Compute the weights for each frequency we process.
-            for iBin in range( numberBins ):
+            print( "Computing weights for output snapshot %d" % (iOutputSnapshot+1) )
+            for iInputBin in range( iStartBin, iStopBin ):
+                iOutputBin = iInputBin - iStartBin
+                print( "\tProcessing frequency %g Hz (bin %d)" %
+                      (inputFft.BinFrequencies[iInputBin], iInputBin) )
+
                 # Form the cross-spectral matrix for this frequency bin.
                 #
                 # To form the CSM for the current frequency, we compute the XX*, where X is an
@@ -886,31 +978,52 @@ class Beamformer:
                 # Our view needs to be transposed (but not conjugated) before multiplying, which is
                 # why it looks like we're computing X'conj(X) instead (where {.}' is the
                 # non-conjugate transpose).
-                currentCsmSnapshots = inputSnapshots[csmSnapshotSlice, iBin, :]
-                currentCsmSnapshot = inputSnapshots[iCsmSnapshot, iBin, :]
+                currentCsmSnapshots = inputSnapshots[csmSnapshotSlice, iInputBin, :]
+                currentCsmSnapshot = inputSnapshots[iCsmSnapshot, iInputBin, :]
                 currentCsm = currentCsmSnapshots.T @ currentCsmSnapshots.conj()
 
                 # For each frequency, scan over all beams and compute a set of weights for each
                 # (frequency, beam) combination.
                 for iBeam in range( numberBeams ):
-                    currentSteeringVector = steeringVectors[iBin, iBeam, :]
-                    print( "Computing weights for Sequence = %d   Bin = %d   Beam = %d" % (iSeq+1, iBin+1, iBeam+1) )
+                    currentSteeringVector = steeringVectors[iOutputBin, iBeam, :]
                     currentWeights = computeWeightsCb( currentCsm, currentSteeringVector )
 
                     # Beamformer output is given by w*x, where w is the Nx1 vector of weights, and x
                     # is the Nx1 vector containing the snapshot data for the current frequency bin.
                     # https://www.acoustics.asn.au/conference_proceedings/AAS2005/papers/8.pdf
-                    outputSnapshot[iBin, iBeam] = np.dot( currentWeights.conj(), currentCsmSnapshot )
+                    outputSnapshot[iOutputBin, iBeam] = np.dot( currentWeights.conj(),
+                                                              currentCsmSnapshot )
 
             # Write out this snapshot and compute how many snapshots we will keep for the next
             # iteration. Note that in this beamforming process, that number should be one less than
             # the number we buffer.
             outputFft.writeSnapshot( outputSnapshot )
+            iOutputSnapshot += 1
             snapshotsToKeep = numberValidSnapshots - numberAvailableCsms
             assert snapshotsToKeep == (numberBufferedSnapshots - 1)
 
-    def _amortizedProcess( self, inputFft, outputFft, numberBufferedSnapshots, computeWeightsCb ):
+    def _amortizedProcess( self, inputFft, outputFft, numberBufferedSnapshots, iStartBin, iStopBin,
+                          computeWeightsCb ):
         print( "Amortized" )
+
+    def _getBinIndicesToProcess( self, binFrequencies ):
+        startHertz = self._bandToProcess.StartHertz
+        stopHertz = self._bandToProcess.StopHertz
+        if startHertz == -np.inf:
+            iStartBin = 0
+        else:
+            iStartBin = -1
+            while (iStartBin + 1) < binFrequencies.size and binFrequencies[iStartBin + 1] <= startHertz:
+                iStartBin += 1
+
+        if stopHertz == np.inf:
+            iStopBin = binFrequencies.size
+        else:
+            iStopBin = binFrequencies.size
+            while iStopBin > 0 and binFrequencies[iStopBin - 1] > stopHertz:
+                iStopBin -= 1
+
+        return (iStartBin, iStopBin)
 
     def _readNextSnapshots( self, inputFft, snapshotBuffer, snapshotsToKeep ):
         numberBufferedSnapshots = snapshotBuffer.shape[0]
@@ -1086,7 +1199,7 @@ def computeWeightsCapon( csm, steeringVector ):
         print( ("Cannot compute Capon beamformer weights. CVXPY not available. Returning " +
                 "conventional weights.") )
         return computeWeightsConventional( csm, steeringVector )
-    
+
     # Reshape the steering vectors so that it's viewed as a 2D array. This just keeps things
     # consistent in our model, where our weight vector is actually shaped like a 2D array.
     # We'll be sure to unpack it after the optimization runs.
@@ -1097,7 +1210,7 @@ def computeWeightsCapon( csm, steeringVector ):
     minimizePowerObjective = cvx.Minimize( cvx.quad_form( weights, csm ) )
     problem = cvx.Problem( minimizePowerObjective, distortionlessResponseConstraint )
     problem.solve()
-    
+
     # Unpack the weights into a 1D array.
     return weights.value.reshape( numberElements )
 
@@ -1178,6 +1291,8 @@ outputBeams = (Beam( 90.0 ),
                Beam( -60.0 ),
                Beam( -90.0 ))
 
+frequencyBandToProcess = FrequencyBand( startHertz=50.0, stopHertz=500.0 )
+
 # Run the simulation.
 numberSnapshots = 30
 print( "Simulating  time series" )
@@ -1189,7 +1304,8 @@ transformer = FourierTransformer( window=HannWindow() )
 transformer.transformTimeSeries( etsFileName, elementFftFileName )
 
 print( "Forming output beams" )
-beamformer = Beamformer( geometry, outputBeams, 2 * geometry.NumberElements, speedOfSound )
+beamformer = Beamformer( geometry, outputBeams, frequencyBandToProcess,
+                        2 * geometry.NumberElements, speedOfSound )
 beamformer.process( elementFftFileName, conventionalBeamformedFftFileName, computeWeightsConventional )
 beamformer.process( elementFftFileName, caponBeamformedFftFileName, computeWeightsCapon )
 
@@ -1295,7 +1411,7 @@ with FourierSpectra.open( conventionalBeamformedFftFileName ) as beamformedFft:
         _ = ax[axRow, axCol].grid( True, which='both' )
         _ = ax[axRow, axCol].set_ylabel( 'Frequency (Hz)' )
         _ = ax[axRow, axCol].set_ylabel( 'Power (dB)' )
-        
+
 with FourierSpectra.open( caponBeamformedFftFileName ) as beamformedFft:
     plotsPerRow = 2
     numberRows = int(np.ceil( beamformedFft.NumberChannels / plotsPerRow ))
