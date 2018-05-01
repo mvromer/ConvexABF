@@ -44,14 +44,29 @@ class ElementTimeSeries:
     @classmethod
     def create( cls, samplesPerSnapshot, numberElements, samplingRate, sampleSizeBytes,
                dataFileName ):
+        """
+        Creates an ETS object for writing.
+
+        The new file will write snapshots of samples with dimensions samplesPerSnapshot-by-
+        numberElements. Each sample will be sampleSizeBytes bytes large.
+
+        """
         return cls( dataFileName, cls.MODE_WRITE, samplesPerSnapshot, numberElements,
                    samplingRate, sampleSizeBytes )
 
     @classmethod
     def open( cls, dataFileName ):
+        """
+        Creates an ETS object for reading.
+
+        """
         return cls( dataFileName, cls.MODE_READ )
 
     def writeSnapshot( self, snapshot ):
+        """
+        Writes the given snapshot to the underlying ETS file.
+
+        """
         numberSnapshotSamples, numberSnapshotElements = snapshot.shape
         assert numberSnapshotSamples == self.SamplesPerSnapshot, \
             "Number of samples per snapshot must be %d" % self.SamplesPerSnapshot
@@ -61,6 +76,10 @@ class ElementTimeSeries:
         self._dataFile.write( snapshot.tobytes() )
 
     def readSnapshot( self ):
+        """
+        Reads the next snapshot from the underlying ETS file.
+
+        """
         readSize = self.SamplesPerSnapshot * self.NumberElements
         snapshot = np.fromfile( self._dataFile, self._sampleDtype, readSize )
         if snapshot.size > 0:
