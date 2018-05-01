@@ -975,23 +975,7 @@ class Beamformer:
         return outputWeights
 
     def _getBinIndicesToProcess( self, binFrequencies ):
-        startHertz = self._bandToProcess.StartHertz
-        stopHertz = self._bandToProcess.StopHertz
-        if startHertz == -np.inf:
-            iStartBin = 0
-        else:
-            iStartBin = -1
-            while (iStartBin + 1) < binFrequencies.size and binFrequencies[iStartBin + 1] <= startHertz:
-                iStartBin += 1
-
-        if stopHertz == np.inf:
-            iStopBin = binFrequencies.size
-        else:
-            iStopBin = binFrequencies.size
-            while iStopBin > 0 and binFrequencies[iStopBin - 1] > stopHertz:
-                iStopBin -= 1
-
-        return (iStartBin, iStopBin)
+        return getBinIndicesForBand( self._bandToProcess, binFrequencies )
 
     def _readNextSnapshots( self, inputFft, snapshotBuffer, snapshotsToKeep ):
         numberBufferedSnapshots = snapshotBuffer.shape[0]
@@ -1081,6 +1065,25 @@ def sphericalToUnitCartesian( azimuth, polar ):
     return np.array( (sinPolar * cosAzimuth,
                       sinPolar * sinAzimuth,
                       cosPolar) )
+
+def getBinIndicesForBand( frequencyBand, binFrequencies ):
+    startHertz = frequencyBand.StartHertz
+    stopHertz = frequencyBand.StopHertz
+    if startHertz == -np.inf:
+        iStartBin = 0
+    else:
+        iStartBin = -1
+        while (iStartBin + 1) < binFrequencies.size and binFrequencies[iStartBin + 1] <= startHertz:
+            iStartBin += 1
+
+    if stopHertz == np.inf:
+        iStopBin = binFrequencies.size
+    else:
+        iStopBin = binFrequencies.size
+        while iStopBin > 0 and binFrequencies[iStopBin - 1] > stopHertz:
+            iStopBin -= 1
+
+    return (iStartBin, iStopBin)
 
 class ConventionalWeights:
     """
@@ -1233,236 +1236,437 @@ def updateRunningSum( slidingWindow, newBlock, runningSum ):
 
 ## OUTPUT SETUP ##
 
-# Dump all output to a temp file location on the file system.
-outputFolder = pathlib.Path( pathlib.Path.home(), 'convexAbf' )
-outputFolder.mkdir( parents=True, exist_ok=True )
-etsFileName = str( outputFolder / 'array.ets' )
-elementFftFileName = str( outputFolder / 'element.fft' )
-conventionalBeamformedFftFileName = str( outputFolder / 'conventionalBeamformed.fft' )
-caponBeamformedFftFileName = str( outputFolder / 'caponBeamformed.fft' )
-conventionalBeamformedFftFileName2 = str( outputFolder / 'conventionalBeamformed2.fft' )
-caponBeamformedFftFileName2 = str( outputFolder / 'caponBeamformed2.fft' )
+def plotArrayGeometry( geometry,
+                      plotSize=(5.0, 8.0),
+                      figureTitle=None ):
+    fig = plt.figure( figsize=plotSize, dpi=90 )
+    ax = fig.add_subplot( 111 )
 
-##  ARRAY DESIGN ##
-speedOfSound = 1480.0
+    showGrid = True
+    figureTitle = figureTitle or "Array Geometry"
+    _ = ax.plot( geometry.X, geometry.Y, "o", markersize=7 )
+    _ = ax.grid( showGrid, which="both" )
+    _ = ax.set_title( figureTitle )
 
-# NOTE: this may change because typically we're interested in a range of frequencies.
-# Maybe half the bandwidth? Maybe design for longest frequency of interest?
-targetFrequency = 400.0
-targetLambda = speedOfSound / targetFrequency
+def plotTimeSeries( etsFileName,
+                   numberSeconds=1.0,
+                   plotsPerRow=4,
+                   plotSize=(4.0, 2.0),
+                   figureTitle=None,
+                   plotTitleFormatter=None ):
+    with ElementTimeSeries.open( etsFileName ) as etsFile:
+        numberSamples = int( np.ceil( numberSeconds * etsFile.SamplingRate ) )
+        sampleTimes = np.linspace( 0.0, numberSeconds, numberSamples, endpoint=False )
+        samples = np.empty( (numberSamples, etsFile.NumberElements) )
+        samplesRead = 0
 
-# Spacing between elements and desired length of the array as functions of the wavelength lambda.
-lambdaElementSpacing = 0.5
-lambdaArrayLength = 10.0
+        while samplesRead < numberSamples:
+            snapshot = etsFile.readSnapshot()
+            if snapshot.size == 0:
+                break
+            samplesToRead = np.minimum( numberSamples - samplesRead, snapshot.shape[0] )
+            samples[samplesRead:(samplesRead + samplesToRead), :] = snapshot[0:samplesToRead, :]
+            samplesRead += samplesToRead
 
-# Required number of elements needed to achieve at least our desired length.
-elementSpacing = targetLambda * lambdaElementSpacing
-numberElements = int( np.ceil( lambdaArrayLength / lambdaElementSpacing ) + 1 )
-geometry = ArrayGeometry.createUniformLinear( numberElements, elementSpacing )
+        sampleTimes = sampleTimes[0:samplesRead]
 
-# Nyquist rate is the minimum sampling rate needed in order to accurately sample a signal without
-# introducing aliasing errors. It must be at least twice the frequency of the signal of interest.
-# This quantity is called the Nyquist frequency.
-nyquistRate = 2.0 * targetFrequency
+        plotWidth, plotHeight = plotSize
+        numberRows = int( np.ceil( etsFile.NumberElements / plotsPerRow ) )
+        fig, ax = plt.subplots( numberRows, plotsPerRow,
+                               figsize=(plotWidth * plotsPerRow, numberRows * plotHeight),
+                               dpi=90,
+                               squeeze=False )
 
-# Sampling rate of each element in our array. We want a sampling rate that is several times greater
-# than our Nyquist rate.
-# http://users.ece.utexas.edu/~bevans/courses/ee381k/lectures/SonarBeamforming/lecture12/discrete.html
-nyquistFactor = 10.0
-samplingRate = nyquistFactor * nyquistRate
+        # Disable those subplots that aren't actually going to be used.
+        iUnusedAxes = np.unravel_index( [i for i in range( etsFile.NumberElements, ax.size )],
+                                         ax.shape )
+        for unusedAxis in ax[iUnusedAxes]:
+            unusedAxis.set_visible( False )
 
-# For convenience, we set our snapshot duration to be the size of our FFT used during beamforming.
-secondsPerSnapshot = 10.0
+        title = figureTitle or "Element Time Series"
+        fig.suptitle( title, y=1, fontsize=14 )
+        fig.tight_layout( pad=4, h_pad=2, w_pad=2 )
 
-## ARRAY SIMULATION ##
-hydrophone = Hydrophone()
-arraySim = ArraySimulator( geometry, hydrophone, samplingRate, secondsPerSnapshot, speedOfSound )
+        for iElement in range( etsFile.NumberElements ):
+            axRow = int(iElement / plotsPerRow)
+            axCol = int(iElement - axRow * plotsPerRow)
+            plotTitle = (plotTitleFormatter( iElement ) if plotTitleFormatter
+                         else ("Element %d" % (iElement + 1)))
 
-# 100 dB is approximate level for ambient noise at sea state 4.
-# http://www.arc.id.au/SoundLevels.html
-noiseGenerator = WhiteNoiseGenerator.createFromSoundPressureLevel( soundPressureLevel=100,
-                                                                  hydrophone=hydrophone )
-noiseGenerator.setSeed( 1 )
-arraySim.setNoiseGenerator( noiseGenerator )
+            _ = ax[axRow, axCol].plot( sampleTimes, samples[:, iElement] )
+            _ = ax[axRow, axCol].set_title( plotTitle )
+            _ = ax[axRow, axCol].grid( True, which="both" )
 
-# 120 dB is about one order of magnitude less than the sound of a fin whale call 100 meters away.
-# For demo purposes, this is ideal as it makes for a quiet target.
-# http://www.arc.id.au/SoundLevels.html
-primaryTarget = Target( PositionAzEl( azimuth=-30.0 ),
-                       frequency=60.0,
-                       soundPressureLevel=120,
-                       signalGenerator=SawtoothGenerator() )
-arraySim.addTarget( primaryTarget )
+def plotPowerSpectra( fftFileName,
+                     numberSnapshots=1,
+                     band=FrequencyBand(),
+                     plotsPerRow=2,
+                     plotSize=(6.0, 2.5),
+                     figureTitle=None,
+                     figureTitleFormatter=None,
+                     plotTitleFormatter=None ):
+    with FourierSpectra.open( fftFileName ) as fftFile:
+        binFrequencies = fftFile.BinFrequencies
+        iStartBin, iStopBin = getBinIndicesForBand( band, binFrequencies )
+        binFrequencies = binFrequencies[iStartBin:iStopBin]
 
-arraySim.addTarget( Target( PositionAzEl( azimuth=-45.0 ),
-                           frequency=100.0,
-                           soundPressureLevel=126,
-                           signalGenerator=SineGenerator() ) )
+        for iSnapshot in range( numberSnapshots ):
+            spectra = fftFile.readSnapshot()
+            if spectra.size == 0:
+                break
+            spectra = spectra[iStartBin:iStopBin, :]
 
-# Beam directions we care about.
-outputBeams = (Beam( 90.0 ),
-               Beam( 60.0 ),
-               Beam( 45.0 ),
-               Beam( 30.0 ),
-               Beam( 0.0 ),
-               Beam( -30.0 ),
-               Beam( -45.0 ),
-               Beam( -60.0 ),
-               Beam( -90.0 ))
+            plotWidth, plotHeight = plotSize
+            numberRows = int(np.ceil( fftFile.NumberChannels / plotsPerRow ))
+            fig, ax = plt.subplots( numberRows, plotsPerRow,
+                                   figsize=(plotWidth * plotsPerRow, plotHeight * numberRows),
+                                   dpi=90,
+                                   squeeze=False )
 
-frequencyBandToProcess = FrequencyBand( startHertz=50.0, stopHertz=130.0 )
+            # Disable those subplots that aren't actually going to be used.
+            iUnusedAxes = np.unravel_index( [i for i in range( fftFile.NumberChannels, ax.size )],
+                                             ax.shape )
+            for unusedAxis in ax[iUnusedAxes]:
+                unusedAxis.set_visible( False )
 
-# Run the simulation.
-numberSnapshots = 30
-print( "Simulating  time series" )
-#arraySim.simulate( numberSnapshots, etsFileName )
+            if not figureTitle:
+                figureTitle = (figureTitleFormatter( iSnapshot ) if figureTitleFormatter
+                               else ("Fourier Spectra Snapshot %d" % (iSnapshot + 1)))
 
-# Produce the Fourier spectra of our time series.
-print( "Computing spectral information" )
-transformer = FourierTransformer( window=HannWindow() )
-#transformer.transformTimeSeries( etsFileName, elementFftFileName )
+            fig.suptitle( figureTitle, y=1, fontsize=14 )
+            fig.tight_layout( pad=4, h_pad=3, w_pad=4 )
 
-print( "Forming output beams" )
-beamformer = Beamformer( geometry, outputBeams, frequencyBandToProcess,
-                        2 * geometry.NumberElements, speedOfSound )
+            for iChannel in range( fftFile.NumberChannels ):
+                axRow = int(iChannel / plotsPerRow)
+                axCol = int(iChannel - axRow * plotsPerRow)
+                channelPower = np.absolute( spectra[:, iChannel] ) ** 2 / fftFile.FftLength
+                channelDb = 10.0 * np.log10( channelPower )
+                channelTitle = (plotTitleFormatter( iChannel ) if plotTitleFormatter
+                                else ("Channel %d" % (iChannel + 1)))
+
+                _ = ax[axRow, axCol].plot( binFrequencies, channelDb )
+                _ = ax[axRow, axCol].set_title( channelTitle )
+                _ = ax[axRow, axCol].grid( True, which="both" )
+                _ = ax[axRow, axCol].set_ylabel( "Frequency (Hz)" )
+                _ = ax[axRow, axCol].set_ylabel( "Power (dB)" )
+
 
 if __name__ == "__main__":
     import time
-    #beamformer.process( elementFftFileName, conventionalBeamformedFftFileName, computeWeightsConventional )
-    #beamformer.process( elementFftFileName, caponBeamformedFftFileName, computeWeightsCapon )
-    timeStart = time.time()
-    #beamformer.process( elementFftFileName, conventionalBeamformedFftFileName2, ConventionalWeights() )
-    beamformer.process( elementFftFileName, caponBeamformedFftFileName2, CaponWeights() )
-    print( "Time taken: %s" % (time.time() - timeStart) )
+    import warnings
 
-## TESTING ##
-import warnings
-warnings.filterwarnings( "ignore", module="matplotlib" )
+    warnings.filterwarnings( "ignore", module="matplotlib" )
 
-print( "Array design frequency: %g Hz" % targetFrequency )
-print( "Array design wavelength: %g meters" % targetLambda )
-print( "Array design element spacing as function of lambda: %g meters" % lambdaElementSpacing )
-print( "Array design length as function of lambda: %g meters" % lambdaArrayLength )
-print( "Computed element spacing: %g meters" % elementSpacing )
-print( "Computed number array elements: %d" % numberElements )
-print( "Computed sampling rate: %g Hz" % samplingRate )
-print( "Seconds per snapshot: %g" % secondsPerSnapshot )
-print( "Speed of sound: %g m/s" % speedOfSound )
+    # This is a flag used to quickly toggle off processing so that we don't regenerate all data.
+    process = False
 
-# Plot the array geometry.
-fig = plt.figure( figsize=(5, 8), dpi=90 )
-ax = fig.add_subplot( 111 )
+    #####
+    # In this section we will be deriving parameters for our array based on more-or-less good rules
+    # of thumb. There's a lot more analysis and rigor that goes on in optimal array design, but
+    # we're not terribly concerned about that here.
+    #
 
-showGrid = True
-_ = ax.plot( geometry.X, geometry.Y, 'o', markersize=7 )
-_ = ax.grid( showGrid, which='both' )
-_ = ax.set_title( 'Array Geometry' )
+    # Speed of sound in water. This actually varies based on a number of factors, but this number
+    # is adequate for our purposes.
+    speedOfSound = 1480.0
 
-# Plot the first portion of the first snapshot of element time series data captured by all array
-# elements in our simulation.
-with ElementTimeSeries.open( etsFileName ) as ets:
-    plotsPerRow = 3
-    numberRows = int(np.ceil( ets.NumberElements / plotsPerRow ))
-    fig, ax = plt.subplots( numberRows, plotsPerRow,
-                           figsize=(3 * plotsPerRow, numberRows * 1.5), dpi=90,
-                           squeeze=False )
-    fig.suptitle( 'Element time series for first simulated snapshot', y=1, fontsize=14 )
-    fig.tight_layout( pad=4, h_pad=2, w_pad=2 )
+    # The "design frequency" of array. This is the frequency we typically want to focus on in our
+    # downstream processing. However, we didn't see any specific rules of thumb on deciding on how
+    # to pick this. For example, since we're typically interested in a range of frequencies, do we
+    # perhaps pick half the bandwidth? Or maybe we instead design for the frequency of interest
+    # that has the longest wavelength? For our purposes, we arbitrarily picked 400 Hz.
+    #
+    # From the target frequency, we're able to readily compute our target wavelength lambda.
+    targetFrequency = 400.0
+    targetLambda = speedOfSound / targetFrequency
+
+    # Spacing between the elements in our array and the desired length of the array as functions of
+    # the target wavelength.
+    lambdaElementSpacing = 0.5
+    lambdaArrayLength = 10.0
+
+    # Required number of elements needed to achieve at least our desired length.
+    elementSpacing = targetLambda * lambdaElementSpacing
+    numberElements = int( np.ceil( lambdaArrayLength / lambdaElementSpacing ) + 1 )
+
+    # Nyquist rate is the minimum sampling rate needed in order to accurately sample a signal
+    # without introducing aliasing errors. It must be at least twice the frequency of the signal of
+    # interest.
+    nyquistRate = 2.0 * targetFrequency
+
+    # Sampling rate of each element in our array. We want a sampling rate that is several times
+    # greater than our Nyquist rate.
+    # http://users.ece.utexas.edu/~bevans/courses/ee381k/lectures/SonarBeamforming/lecture12/discrete.html
+    nyquistFactor = 10.0
+    samplingRate = nyquistFactor * nyquistRate
+
+    # For convenience, we set our snapshot duration (in seconds) to be equal to the size of our FFT
+    # used during beamforming.
+    secondsPerSnapshot = 10.0
+
+    #####
+    # In this next section, we construct our simulated array using the design parameters computed
+    # above. Using this, we simulate the signals of a couple of targets at different directions
+    # relative to the array along with some Gaussian white noise. This simulated time series data
+    # will be the input into our beamforming process that occurs later.
+    #
+
+    # Create a uniform linear array, which means all elements are colinear, and equal spacing is
+    # between adjacent elements.
+    geometry = ArrayGeometry.createUniformLinear( numberElements, elementSpacing )
+
+    # Each element is represented by our canoncial hydrophone. The hydrophone is responsible for
+    # converting pressure from acoustic waves into a corresponding voltage that is sampled as a
+    # function of time. The discrete voltage signal becomes our digital representation of the
+    # acoustic signals in our simulated array environment. In our array, we use identical,
+    # isotropic hydrophones, which means their response to acoustic waves is equal in all
+    # directions.
+    hydrophone = Hydrophone()
+
+    # Using the pieces we've previously constructed, we now construct our simulated array.
+    arraySim = ArraySimulator( geometry,
+                              hydrophone,
+                              samplingRate,
+                              secondsPerSnapshot,
+                              speedOfSound )
+
+    #####
+    # Below we will construct our simulated environment by adding a white noise generator to
+    # simulate ocean noise and different target signals the simulated array will record in its
+    # generated time series.
+    #
+
+    # Add a white noise generator that will simulate ambient ocean noise. 100 dB is approximate
+    # level for ambient noise at sea state 4.
+    # Reference: http://www.arc.id.au/SoundLevels.html
+    #
+    # We set a constant seed so that we produce the same data with each run.
+    #
+    noiseGenerator = WhiteNoiseGenerator.createFromSoundPressureLevel( soundPressureLevel=100,
+                                                                      hydrophone=hydrophone )
+    noiseGenerator.setSeed( 1 )
+    arraySim.setNoiseGenerator( noiseGenerator )
+
+    # Add one target 30 degrees to the right of broadside. This will be our primary target and will
+    # have a sawtooth acoustic signature. The sawtooth signal generates a set of harmonics whose
+    # amplitude falls off at a rate of 1/N. This will help us better identify our signal in our
+    # Fourier spectra.
+    #
+    # 120 dB is about one order of magnitude less than the sound of a fin whale call 100 meters away.
+    # http://www.arc.id.au/SoundLevels.html
+    #
+    primaryTarget = Target( PositionAzEl( azimuth=-30.0 ),
+                           frequency=60.0,
+                           soundPressureLevel=120,
+                           signalGenerator=SawtoothGenerator() )
+    arraySim.addTarget( primaryTarget )
+
+    # We add another target 45 degrees to the right of broadside, It is louder than our primary
+    # target and will have a tendency to dominate. It is placed 6 dB louder than our primary target,
+    # which should represent roughly twice the amount of power. Its acoustic signature will be a
+    # sine wave, so it will have a single peak in the Fourier spectra at its configured frequency.
+    arraySim.addTarget( Target( PositionAzEl( azimuth=-45.0 ),
+                               frequency=100.0,
+                               soundPressureLevel=126,
+                               signalGenerator=SineGenerator() ) )
+
+    #####
+    # Next we configure our transformer, which is responsible for converting our element time series
+    # data in a set of Fourier spectra, one for each element in the array.
+    #
+    # The transformer accomplishes this by means of a fast Fourier transform. Two common parameters
+    # used in configuring this stage are a windowing function and an overlap percentage.
+    #
+    # The discrete Fourier transform assumes the signal transformed is periodic. However, since the
+    # transformer works on snapshots of time series data at a time, it's unlikely the samples in the
+    # FFT buffer at any given time resemble a periodic signal. The windowing function is used to
+    # ensure the samples at the beginning and end of our FFT buffer approach a common value, thus
+    # allowing them to appear periodic if you were to stack them end-to-end.
+    #
+    # The transformer can be configured to keep some percentage of the samples from the previous
+    # transform in the FFT buffer for the next transform. This is controlled by the overlap
+    # percentage.
+    #
+    # One reason we might care about setting the overlap percentage to some non-zero value is when
+    # it's used in conjunction with windowing. In particular, if we use a Hann window with an
+    # overlap percentage of 50%, it can be shown that our Fourier spectra won't exhibit amplitude
+    # fluctuations that differ from our original time series data.
+    # Reference:
+    # https://kevinsprojects.wordpress.com/2014/12/13/short-time-fourier-transform-using-python-and-numpy/
+    #
+    transformer = FourierTransformer( overlap=0.5, window=HannWindow() )
+
+    #####
+    # Finally we configure our beamformer. Fundamentally, a beamformer requires only a few items:
+    # the geometry of the array being processed, a list of output beams to form, and some
+    # environmental information such as the speed of sound in water.
+    #
+    # A broadband beamformer in the frequency domain typically works by using the FFT to break a
+    # broadband signal into a number of narrowband components (the individual frequency bins of the
+    # FFT's output) and performs narrowband beamforming on each of those components.
+    #
+    # Since the transformed time series data can have A LOT of frequency bins (depending on the size
+    # of the transform), the amount of work the beamformer must perform can quickly become huge.
+    #
+    # For this reason, the beamformer we developed can also take in an optional frequency band that
+    # tells the beamformer over which frequency components to process. If no frequency band were
+    # specified, then the beamformer would work over the entire bandwidth available in the incoming
+    # Fourier spectra data stream.
+    #
+    # There are two other key processing parameters that impact the performance of the beamformer.
+    # The first is a time averaging factor. Most beamforming algorithm formulations assume the true
+    # cross spectral matrix is known for both the signal of interest and the noise in the
+    # environment. In practice this isn't true, and the cross spectral matrix is replaced by the
+    # sample estimate of the CSM.
+    #
+    # If X(f, k) is the spectral data for frequency component f and snapshot k, then the sample CSM
+    # is the average of X(f,k) X*(f,k) for k = k1 to kJ. Here J is the number of snapshots that are
+    # averaged to form our sample CSM. In practice, it's important to choose a high enough value for
+    # J so that we are getting an accurate estimate for our true CSM.
+    #
+    # The second key processing parameter is the algorithm used for computing the beamforming
+    # weights. The beamforming weights are computed on per frequency, per output beam basis. They
+    # essentially alter the response of the beamformer and steer maximum response towards signals
+    # and directions we care about while placing nulls (areas of little to no response) towards
+    # interfering signals and directions.
+    #
+    # Different algorithms have different trade offs in terms of computational complexity and
+    # performance. In general, conventional weights are the fastest to compute, but they offer no
+    # adaptivity against interfering signals. Different adaptive algorithms try to pick optimal
+    # weights subject to different response constraints. Different algorithms also have different
+    # degrees of sensitivty to error in both the sample CSM and the steering vector formed for a
+    # particular output beam.
+    #
+
+    # The output beams we wish to form. Each channel in our beamformer's output will correspond to
+    # one of these output beams. Each channel's spectrum will show the frequency content arriving
+    # from that beam's direction.
+    #
+    # Note that these beam angles are relative to our local coordinate system and not to our array.
+    # We have ensured that our array is positioned in our coordinate system such that its broadside,
+    # which is the direction perpendicular to the axis of the array, coincides with 0 degrees.
+    # It is customary in sonar applications to have broadside labeled as 0 degrees.
+    #
+    outputBeams = (Beam( 90.0 ),
+                   Beam( 60.0 ),
+                   Beam( 45.0 ),
+                   Beam( 30.0 ),
+                   Beam( 0.0 ),
+                   Beam( -30.0 ),
+                   Beam( -45.0 ),
+                   Beam( -60.0 ),
+                   Beam( -90.0 ))
+
+    # The frequency band we want to process in our beamformer. A real world application would have
+    # a far greater frequency extent processed, but for purposes of keeping computation time down,
+    # we limit our processing band. This will at least enable us to see our two simulated targets in
+    # our beamformer's output.
+    frequencyBandToProcess = FrequencyBand( startHertz=50.0, stopHertz=130.0 )
+
+    # Here we choose a snapshot average count of twice the number of elements. This adheres to the
+    # so called RMB rule that says at least 2N snapshots should be used in order to keep the average
+    # loss to less than 3 dB.
+    # Reference:
+    # I. S. Reed, J. D. Mallett and L. E. Brennan, "Rapid Convergence Rate in Adaptive Arrays"
+    beamformer = Beamformer( geometry, outputBeams, frequencyBandToProcess,
+                            snapshotAverageCount=2 * geometry.NumberElements,
+                            speedOfSound=speedOfSound )
+
+    #####
+    # Below we now run all parts of our system end to end. We perform beamforming using different
+    # weight algorithms so that we can compare their performance afterward.
+    #
+
+    # Setup paths to the files we will be generating at each stage of the system.
+    outputFolder = pathlib.Path( pathlib.Path.home(), "convexAbf" )
+    outputFolder.mkdir( parents=True, exist_ok=True )
+
+    etsFileName = str( outputFolder / "rawTimeSeries.ets" )
+    elementFftFileName = str( outputFolder / "elementSpectra.fft" )
+    conventionalBeamformedFftFileName = str( outputFolder / "beamformedSpectraConventional.fft" )
+    caponBeamformedFftFileName = str( outputFolder / "beamformedSpectraCapon.fft" )
+    robustCaponBeamformedFftFileName = str( outputFolder / "beamformedSpectraRobustCapon.fft" )
+
+    # Generate our simulated time series. We arbitrarily picked how many snapshots of time series
+    # data we'll generate.
+    print( "Simulating time series..." )
+    if process:
+        arraySim.simulate( numberSnapshots=30, fileName=etsFileName )
+
+    # Produce the Fourier spectra of our time series.
+    print( "Computing spectral information..." )
+    if process:
+        transformer.transformTimeSeries( etsFileName, elementFftFileName )
+
+    # Run the beamformer for each of the following weight algorithms:
+    #
+    #     Conventional weights - no adaptivity
+    #     Capon weights - standard minimum variance distortionless response (MVDR) weighting
+    #     Robut Capon weights - MVDR with uncertainty modelled in the steering vector
+    #
+    print( "Forming output beams with conventional beamformer..." )
+    startTime = time.time()
+    if process:
+        beamformer.process( elementFftFileName,
+                           conventionalBeamformedFftFileName,
+                           ConventionalWeights() )
+    conventionalTime = time.time() - startTime
+
+    print( "Forming output beams with standard Capon beamformer..." )
+    startTime = time.time()
+    if process:
+        beamformer.process( elementFftFileName,
+                           caponBeamformedFftFileName,
+                           CaponWeights() )
+    caponTime = time.time() - startTime
+
+    print( "Forming output beams with robust Capon beamformer..." )
+    startTime = time.time()
+    if process:
+        beamformer.process( elementFftFileName,
+                           robustCaponBeamformedFftFileName,
+                           RobustCaponWeights( ) )
+    robustCaponTime = time.time() - startTime
+
+    #####
+    # In this section we output all the results of the above simulations. We display information on
+    # the array we designed, the data we generated, and we produce plots of the element time series,
+    # element Fourier spectra, and beamformed Fourier spectra for each of the beamformers.
+    #
+
+    print( "Array design frequency: %g Hz" % targetFrequency )
+    print( "Array design wavelength: %g meters" % targetLambda )
+    print( "Array design element spacing as function of lambda: %g meters" % lambdaElementSpacing )
+    print( "Array design length as function of lambda: %g meters" % lambdaArrayLength )
+    print( "Computed element spacing: %g meters" % elementSpacing )
+    print( "Computed number array elements: %d" % numberElements )
+    print( "Computed sampling rate: %g Hz" % samplingRate )
+    print( "Seconds per snapshot: %g" % secondsPerSnapshot )
+    print( "Speed of sound: %g m/s" % speedOfSound )
+    print( "Conventional beamforming time: %g sec" % conventionalTime )
+    print( "Standard Capon beamforming time: %g sec" % caponTime )
+    print( "Robust Capon beamforming time: %g sec" % robustCaponTime )
+
+    plotArrayGeometry( geometry )
 
     # Plot only two cycles of our primary target's signature. Note that this will be the
     # superposition of the primary target along with all other targets and whatever noise was in the
     # simulation.
-    t = np.linspace( 0.0,
-                    2.0 / primaryTarget._frequency,
-                    2 * int(ets.SamplingRate/ primaryTarget._frequency),
-                    endpoint=False )
-    s = ets.readSnapshot()
+    plotTimeSeries( etsFileName,
+                   numberSeconds = 2.0 / primaryTarget._frequency,
+                   figureTitle="Element time series for first simulated snapshot" )
 
-    for iElement in range( ets.NumberElements ):
-        axRow = int(iElement / plotsPerRow)
-        axCol = int(iElement - axRow * plotsPerRow)
-        _ = ax[axRow, axCol].plot( t, s[0:len(t),iElement] )
-        _ = ax[axRow, axCol].set_title( 'Element %d' % (iElement + 1) )
-        _ = ax[axRow, axCol].grid( True, which='both' )
+    plotPowerSpectra( elementFftFileName,
+                     band=FrequencyBand( 50.0, 130.0 ),
+                     figureTitle="Fourier spectra for first simulated snapshot" )
 
+    plotPowerSpectra( conventionalBeamformedFftFileName,
+                     figureTitle="Conventionally beamformed spectra for first simulated snapshot",
+                     plotTitleFormatter=lambda iBeam: "Beam %d" % (iBeam + 1) )
 
-with FourierSpectra.open( elementFftFileName ) as fft:
-    plotsPerRow = 2
-    numberRows = int(np.ceil( fft.NumberChannels / plotsPerRow ))
-    fig, ax = plt.subplots( numberRows, plotsPerRow,
-                           figsize=(6 * plotsPerRow, numberRows * 3), dpi=90,
-                           squeeze=False )
-    fig.suptitle( 'Fourier spectra for first simulated snapshot', y=1, fontsize=14 )
-    fig.tight_layout( pad=4, h_pad=2, w_pad=2 )
-
-    binFrequencies = fft.BinFrequencies
-    binFrequencies = binFrequencies[ binFrequencies < 250.0 ]
-    spectra = fft.readSnapshot()
-
-    for iChannel in range( fft.NumberChannels ):
-        axRow = int(iChannel / plotsPerRow)
-        axCol = int(iChannel - axRow * plotsPerRow)
-        channelPower = np.absolute( spectra[0:len(binFrequencies),iChannel] ) / fft.FftLength
-        channelDb = 10.0 * np.log10( channelPower )
-        normChannelPower = channelPower / np.max( channelPower )
-        normChannelDb = 10.0 * np.log10( normChannelPower )
-        _ = ax[axRow, axCol].plot( binFrequencies, channelDb )
-        _ = ax[axRow, axCol].set_title( 'Element %d' % (iChannel + 1) )
-        _ = ax[axRow, axCol].grid( True, which='both' )
-        _ = ax[axRow, axCol].set_ylabel( 'Frequency (Hz)' )
-        _ = ax[axRow, axCol].set_ylabel( 'Power (dB)' )
-
-with FourierSpectra.open( conventionalBeamformedFftFileName2 ) as beamformedFft:
-    plotsPerRow = 2
-    numberRows = int(np.ceil( beamformedFft.NumberChannels / plotsPerRow ))
-    fig, ax = plt.subplots( numberRows, plotsPerRow,
-                           figsize=(6 * plotsPerRow, numberRows * 3), dpi=90,
-                           squeeze=False )
-    fig.suptitle( 'Conventionally beamformed spectra for first simulated snapshot', y=1, fontsize=14 )
-    fig.tight_layout( pad=4, h_pad=2, w_pad=2 )
-
-    binFrequencies = beamformedFft.BinFrequencies
-    binFrequencies = binFrequencies[ binFrequencies < 250.0 ]
-    spectra = beamformedFft.readSnapshot()
-
-    for iChannel in range( beamformedFft.NumberChannels ):
-        axRow = int(iChannel / plotsPerRow)
-        axCol = int(iChannel - axRow * plotsPerRow)
-        channelPower = np.absolute( spectra[0:len(binFrequencies),iChannel] ) / beamformedFft.FftLength
-        channelDb = 10.0 * np.log10( channelPower )
-        normChannelPower = channelPower / np.max( channelPower )
-        normChannelDb = 10.0 * np.log10( normChannelPower )
-        _ = ax[axRow, axCol].plot( binFrequencies, channelDb )
-        _ = ax[axRow, axCol].set_title( 'Beam %d' % (iChannel + 1) )
-        _ = ax[axRow, axCol].grid( True, which='both' )
-        _ = ax[axRow, axCol].set_ylabel( 'Frequency (Hz)' )
-        _ = ax[axRow, axCol].set_ylabel( 'Power (dB)' )
-
-with FourierSpectra.open( caponBeamformedFftFileName2 ) as beamformedFft:
-    plotsPerRow = 2
-    numberRows = int(np.ceil( beamformedFft.NumberChannels / plotsPerRow ))
-    fig, ax = plt.subplots( numberRows, plotsPerRow,
-                           figsize=(6 * plotsPerRow, numberRows * 3), dpi=90,
-                           squeeze=False )
-    fig.suptitle( 'Capon beamformed spectra for first simulated snapshot', y=1, fontsize=14 )
-    fig.tight_layout( pad=4, h_pad=2, w_pad=2 )
-
-    binFrequencies = beamformedFft.BinFrequencies
-    binFrequencies = binFrequencies[ binFrequencies < 250.0 ]
-    spectra = beamformedFft.readSnapshot()
-
-    for iChannel in range( beamformedFft.NumberChannels ):
-        axRow = int(iChannel / plotsPerRow)
-        axCol = int(iChannel - axRow * plotsPerRow)
-        channelPower = np.absolute( spectra[0:len(binFrequencies),iChannel] ) / beamformedFft.FftLength
-        channelDb = 10.0 * np.log10( channelPower )
-        normChannelPower = channelPower / np.max( channelPower )
-        normChannelDb = 10.0 * np.log10( normChannelPower )
-        _ = ax[axRow, axCol].plot( binFrequencies, channelDb )
-        _ = ax[axRow, axCol].set_title( 'Beam %d' % (iChannel + 1) )
-        _ = ax[axRow, axCol].grid( True, which='both' )
-        _ = ax[axRow, axCol].set_ylabel( 'Frequency (Hz)' )
-        _ = ax[axRow, axCol].set_ylabel( 'Power (dB)' )
+    plotPowerSpectra( caponBeamformedFftFileName,
+                     figureTitle="Capon beamformed spectra for first simulated snapshot",
+                     plotTitleFormatter=lambda iBeam: "Beam %d" % (iBeam + 1) )
 
 ## This test demonstrates how a denormal number time[5] fed into sig.sawtooth produces a NaN ##
 #snapshotStartTime = 0.0
