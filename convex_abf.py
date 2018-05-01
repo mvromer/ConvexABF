@@ -833,7 +833,7 @@ class Beamformer:
     def _NumberBeams( self ):
         return len( self._outputBeams )
 
-    def process( self, inputFileName, outputFileName, computeWeightsCb ):
+    def process( self, inputFileName, outputFileName, weightAlgorithm ):
         with FourierSpectra.open( inputFileName ) as inputFft:
             # Figure out the frequency band we're going to process.
             iStartBin, iStopBin = self._getBinIndicesToProcess( inputFft.BinFrequencies )
@@ -846,9 +846,9 @@ class Beamformer:
             with FourierSpectra.create( inputFft.FftLength, inputFft.SamplingRate,
                                        self._NumberBeams, numberBins, binFrequencies,
                                        outputFileName ) as outputFft:
-                self._innerProcess( inputFft, outputFft, iStartBin, iStopBin, computeWeightsCb )
+                self._innerProcess( inputFft, outputFft, iStartBin, iStopBin, weightAlgorithm )
 
-    def _innerProcess( self, inputFft, outputFft, iStartBin, iStopBin, computeWeightsCb ):
+    def _innerProcess( self, inputFft, outputFft, iStartBin, iStopBin, weightAlgorithm ):
         numberBufferedSnapshots = self._snapshotAverageCount
         numberInputBins = inputFft.NumberBins
         numberOutputBins = iStopBin - iStartBin
@@ -893,7 +893,7 @@ class Beamformer:
                 processArgs = ((inputFft.BinFrequencies[iInputBin],
                                 inputSnapshots[csmSnapshotSlice, iInputBin, :],   # csmSnapshots
                                 steeringVectors[(iInputBin -  iStartBin), :, :],  # steeringVectors
-                                computeWeightsCb)                                 # computeWeightsCb
+                                weightAlgorithm)                                  # weightAlgorithm
                                for iInputBin in range( iStartBin, iStopBin ))
 
                 weights = pool.starmap( self._processCsm, processArgs, chunksize=10 )
@@ -929,7 +929,7 @@ class Beamformer:
                 assert snapshotsToKeep == (numberBufferedSnapshots - 1)
 
     @staticmethod
-    def _processCsm( binFrequency, csmSnapshots, steeringVectors, computeWeightsCb ):
+    def _processCsm( binFrequency, csmSnapshots, steeringVectors, weightAlgorithm ):
         # Form the cross-spectral matrix from the given snapshots.
         #
         # To form the CSM for the current frequency, we compute the XX*, where X is an N-by-J matrix
@@ -942,7 +942,7 @@ class Beamformer:
         # be transposed (but not conjugated) before multiplying, which is why it looks like we're
         # computing X'conj(X) instead (where {.}' is the non-conjugate transpose).
         #
-        print( "Processing bin frequency %g Hz" % binFrequency )
+        #print( "Processing bin frequency %g Hz" % binFrequency )
         numberSnapshots = csmSnapshots.shape[0]
         csm = (1.0 / numberSnapshots) * (csmSnapshots.T @ csmSnapshots.conj())
 
@@ -951,7 +951,7 @@ class Beamformer:
         outputWeights = np.empty( shape=(numberBeams, numberElements), dtype=np.complex )
         for iBeam in range( numberBeams ):
             currentSteeringVector = steeringVectors[iBeam, :]
-            outputWeights[iBeam, :] = computeWeightsCb( csm, currentSteeringVector )
+            outputWeights[iBeam, :] = weightAlgorithm.compute( csm, currentSteeringVector )
 
         return outputWeights
 
@@ -1063,32 +1063,82 @@ def sphericalToUnitCartesian( azimuth, polar ):
                       sinPolar * sinAzimuth,
                       cosPolar) )
 
-def computeWeightsConventional( csm, steeringVector ):
-    # Conventional beamforming has weights that are equal to the steering vector, which essentially
-    # introduces a phase shift to maximize response in the corresponding direction of arrival (DOA).
-    return np.copy( steeringVector )
+class ConventionalWeights:
+    """
+    Computes the conventional beamformer weights.
 
-def computeWeightsCapon( csm, steeringVector ):
-    try:
-        import cvxpy as cvx
-    except ImportError:
-        print( ("Cannot compute Capon beamformer weights. CVXPY not available. Returning " +
-                "conventional weights.") )
-        return computeWeightsConventional( csm, steeringVector )
+    A conventional beamformer is simply a delay-and-sum beamformer in the time domain. In the
+    frequency domain for a narrowband signal, the time delay is approximated by a phase shift. The
+    conventional beamforming weights are equal to the steering vector corresponding with the desired
+    direction of arrival.
 
-    # Reshape the steering vectors so that it's viewed as a 2D array. This just keeps things
-    # consistent in our model, where our weight vector is actually shaped like a 2D array.
-    # We'll be sure to unpack it after the optimization runs.
-    numberElements = steeringVector.size
-    steeringVector2D = steeringVector.reshape( (numberElements, 1) )
-    weights = cvx.Variable( (numberElements, 1), complex=True )
-    distortionlessResponseConstraint = [weights.H * steeringVector2D == 1.0]
-    minimizePowerObjective = cvx.Minimize( cvx.quad_form( weights, csm ) )
-    problem = cvx.Problem( minimizePowerObjective, distortionlessResponseConstraint )
-    problem.solve()
+    """
+    def compute( self, csm, steeringVector ):
+        return np.copy( steeringVector )
 
-    # Unpack the weights into a 1D array.
-    return weights.value.reshape( numberElements )
+class CaponWeights:
+    """
+    Computes the standard Capon beamformer weights.
+
+    The Capon beamformer is also known as the minimum variance distortionless response (MVDR)
+    beamformer. It is the set of weights that minimize the power of the sample cross spectral matrix
+    while maintaining unity gain in the when focusing in on a particular direction of arrival (as
+    given by the steering vector).
+
+    """
+    def compute( self, csm, steeringVector ):
+        try:
+            import cvxpy as cvx
+        except ImportError:
+            print( ("Cannot compute Capon beamformer weights. CVXPY not available. Returning " +
+                    "conventional weights.") )
+            return ConventionalWeights().compute( csm, steeringVector )
+
+        # Reshape the steering vector so that it's viewed as a 2D array. This just keeps things
+        # consistent in our model, where our weight vector is actually shaped like a 2D array.
+        # We'll be sure to reshape the final weights as a 1D array after the optimization runs.
+        numberElements = steeringVector.size
+        steeringVector2D = steeringVector.reshape( (numberElements, 1) )
+
+        weights = cvx.Variable( (numberElements, 1), complex=True )
+        distortionlessResponseConstraint = [weights.H * steeringVector2D == 1.0]
+
+        # The quad form is given by (w* R w), where w is our vector of weights and R is our sample
+        # cross spectral matrix.
+        minimizePowerObjective = cvx.Minimize( cvx.quad_form( weights, csm ) )
+        problem = cvx.Problem( minimizePowerObjective, distortionlessResponseConstraint )
+        problem.solve()
+
+        # Reshape the weights into a 1D array.
+        return weights.value.reshape( numberElements )
+
+class RobustCaponWeights:
+    """
+    Computes the robust Capon beamformer weights given by:
+    Robust Adaptive Beamforming Using Worst-Case Performance Optimization: A Solutiono to the Signal
+    Mismatch Problem
+
+    https://www.researchgate.net/publication/3318526_Robust_adaptive_beamforming_using_worst-case_performance_optimization_A_solution_to_the_signal_mismatch_problem
+
+    The robust Capon beamformer weights address errors in the steering vector by constraining
+    response to be at least unity gain within in some uncertainty region centered on the desired
+    direction of arrival. It otherwise seeks to minimize the power of sample cross spectral matrix
+    just like the standard Capon beamformer.
+
+    """
+    def __init__( self, steeringVectorError ):
+        self._steeringVectorError = steeringVectorError
+
+    def compute( self, csm, steeringVector ):
+        try:
+            import cvxpy as cvx
+        except ImportError:
+            print( ("Cannot compute Capon beamformer weights. CVXPY not available. Returning " +
+                    "conventional weights.") )
+            return ConventionalWeights().compute( csm, steeringVector )
+
+        # TODO: Implement me.
+        return ConventionalWeights().compute( csm, steeringVector )
 
 class SlidingWindow:
     @classmethod
@@ -1258,10 +1308,13 @@ beamformer = Beamformer( geometry, outputBeams, frequencyBandToProcess,
                         2 * geometry.NumberElements, speedOfSound )
 
 if __name__ == "__main__":
+    import time
     #beamformer.process( elementFftFileName, conventionalBeamformedFftFileName, computeWeightsConventional )
     #beamformer.process( elementFftFileName, caponBeamformedFftFileName, computeWeightsCapon )
-    #beamformer.process( elementFftFileName, conventionalBeamformedFftFileName2, computeWeightsConventional )
-    beamformer.process( elementFftFileName, caponBeamformedFftFileName2, computeWeightsCapon )
+    timeStart = time.time()
+    #beamformer.process( elementFftFileName, conventionalBeamformedFftFileName2, ConventionalWeights() )
+    beamformer.process( elementFftFileName, caponBeamformedFftFileName2, CaponWeights() )
+    print( "Time taken: %s" % (time.time() - timeStart) )
 
 ## TESTING ##
 import warnings
