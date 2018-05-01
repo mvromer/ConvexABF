@@ -1358,7 +1358,7 @@ if __name__ == "__main__":
     warnings.filterwarnings( "ignore", module="matplotlib" )
 
     # This is a flag used to quickly toggle off processing so that we don't regenerate all data.
-    process = False
+    process = True
 
     #####
     # In this section we will be deriving parameters for our array based on more-or-less good rules
@@ -1622,7 +1622,7 @@ if __name__ == "__main__":
 
     print( "Forming output beams with robust Capon beamformer..." )
     startTime = time.time()
-    if process:
+    if False:
         beamformer.process( elementFftFileName,
                            robustCaponBeamformedFftFileName,
                            RobustCaponWeights( ) )
