@@ -7,6 +7,7 @@
 # http://www.personal.psu.edu/faculty/m/x/mxm14/sonar/beamforming.pdf
 # http://www.uio.no/studier/emner/matnat/ifi/INF5410/v12/undervisningsmateriale/foils/AdaptiveBeamforming.pdf
 
+import functools
 import itertools
 import multiprocessing
 import pathlib
@@ -16,6 +17,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 import scipy as sp
 import scipy.signal as sig
+
+import picos as pic
 
 from matplotlib import animation, rc
 from IPython.display import HTML
@@ -1109,35 +1112,92 @@ class CaponWeights:
 
     """
     def compute( self, csm, steeringVector ):
-        try:
-            import cvxpy as cvx
-        except ImportError:
-            print( ("Cannot compute Capon beamformer weights. CVXPY not available. Returning " +
-                    "conventional weights.") )
-            return ConventionalWeights().compute( csm, steeringVector )
-
         # Reshape the steering vector so that it's viewed as a 2D array. This just keeps things
         # consistent in our model, where our weight vector is actually shaped like a 2D array.
         # We'll be sure to reshape the final weights as a 1D array after the optimization runs.
         numberElements = steeringVector.size
         steeringVector2D = steeringVector.reshape( (numberElements, 1) )
 
-        weights = cvx.Variable( (numberElements, 1), complex=True )
-        distortionlessResponseConstraint = [weights.H * steeringVector2D == 1.0]
+        # Picos wasn't able to properly handle the quadratic objective function w*Rw, where R our
+        # CSM and w is our weight vector. It appears that it can't verify that the objective is
+        # real-valued since it's a quadratic expression. To get around this, we hoist the problem
+        # from a set of complex-valued matrices and vectors into real-valued ones.
+        #
+        # For the CSM, we let the lifted version be [Re(csm) -Im(csm) ; Im(csm) Re(csm)]. For the
+        # steering vector, we formulate it as [Re(steeringVector) ; Im(steeringVector)].
+        #
+        liftedCsm = np.bmat( [[np.real( csm ), -np.imag( csm )],
+                               [np.imag( csm ), np.real( csm )]] )
+
+        liftedSteeringVector = np.vstack( [np.vstack( [np.real( sv ),
+                                                       np.imag( sv )] ) for sv in steeringVector2D] )
+
+        P = pic.Problem()
+        weights = P.add_variable( "weights", (2 * numberElements, 1) )
+        csmParam = pic.new_param( "csm", liftedCsm )
+        steeringVectorParam = pic.new_param( "steeringVector", liftedSteeringVector )
+
+        # Our distortionless response contraint is w*v == 1.0, where w is the weight vector and v is
+        # the steering vector. Since the constraint uses the complex conjugate, we formulate the
+        # the lifted weight vector (for this constraint) as [Re(weights) ; -Im(weights)]. Since we
+        # want to constrain the left hand side to be unity, i.e., 1 + 0j, the right hand side turns
+        # from the scalar 1 to the unit vector [1 ; 0].
+        w_r = weights[0:numberElements]
+        w_i = weights[numberElements:]
+        top = functools.reduce( lambda x, y: x & y,
+                               (wi_r & wi_i for wi_r, wi_i in zip( w_r, w_i )) )
+        bottom = functools.reduce( lambda x, y: x & y,
+                                  (-wi_i & wi_r for wi_r, wi_i in zip( w_r, w_i )) )
+        liftedWeightsConj = top // bottom
+        lhs = liftedWeightsConj * steeringVectorParam
+        rhs = np.array( [[1.0], [0.0]] )
+        P.add_constraint( lhs == rhs )
+
+        P.set_objective( "min", weights.T * csmParam * weights )
+        P.solve( verbose=0 )
+
+        # We extract out the real and imaginary parts from our weight vector and return it as a
+        # complex 1D array.
+        return np.array( weights.value[0:numberElements] +
+                        1j * weights.value[numberElements:] ).reshape( numberElements  )
+
+
+        # Below is the original implementation we had for this algorithm using cvxpy + cvxopt.
+        # Modeling the problem was more straightforward given that it better handled the quadratic
+        # objective defined in terms of complex vectors and matrices. However, it was slow, and it
+        # seemed in capable of handling the robust weight computuation optimization problem.
+        #
+        # It also had some stability issues, namely it would crap out with a dimension mismatch
+        # error due to some internal bug in cvxpy's layer that translates from cvxopt output to a
+        # standardized form. For these reasons, we looked into other solvers capable of handling
+        # both complex valued vectors and matrices as well as quadratic objectives.
+        #
+        # This led us to finding this (https://peterwittek.com/sdp-in-python.html) site that
+        # recommended Picos and the cvxpy's list of supported solvers and their capabilities
+        # (https://cvxgrp.github.io/cvxpy/tutorial/advanced/index.html#solve-method-options) that
+        # mentioned Mosek as a solver capable of solving up to semidefinite programs. In the end,
+        # that's how we arrived at our choice of back-end solver (Mosek) and front-end interface
+        # (Picos).
+
+        #numberElements = steeringVector.size
+        #steeringVector2D = steeringVector.reshape( (numberElements, 1) )
+
+        #weights = cvx.Variable( (numberElements, 1), complex=True )
+        #distortionlessResponseConstraint = [weights.H * steeringVector2D == 1.0]
 
         # The quad form is given by (w* R w), where w is our vector of weights and R is our sample
         # cross spectral matrix.
-        minimizePowerObjective = cvx.Minimize( cvx.quad_form( weights, csm ) )
-        problem = cvx.Problem( minimizePowerObjective, distortionlessResponseConstraint )
-        problem.solve()
+        #minimizePowerObjective = cvx.Minimize( cvx.quad_form( weights, csm ) )
+        #problem = cvx.Problem( minimizePowerObjective, distortionlessResponseConstraint )
+        #problem.solve()
 
         # Reshape the weights into a 1D array.
-        return weights.value.reshape( numberElements )
+        #return weights.value.reshape( numberElements )
 
 class RobustCaponWeights:
     """
     Computes the robust Capon beamformer weights given by:
-    Robust Adaptive Beamforming Using Worst-Case Performance Optimization: A Solutiono to the Signal
+    Robust Adaptive Beamforming Using Worst-Case Performance Optimization: A Solution to the Signal
     Mismatch Problem
 
     https://www.researchgate.net/publication/3318526_Robust_adaptive_beamforming_using_worst-case_performance_optimization_A_solution_to_the_signal_mismatch_problem
@@ -1152,15 +1212,78 @@ class RobustCaponWeights:
         self._steeringVectorError = steeringVectorError
 
     def compute( self, csm, steeringVector ):
-        try:
-            import cvxpy as cvx
-        except ImportError:
-            print( ("Cannot compute Capon beamformer weights. CVXPY not available. Returning " +
-                    "conventional weights.") )
-            return ConventionalWeights().compute( csm, steeringVector )
+        # Reshape the steering vector so that it's viewed as a 2D array. This just keeps things
+        # consistent in our model, where our weight vector is actually shaped like a 2D array.
+        # We'll be sure to reshape the final weights as a 1D array after the optimization runs.
+        numberElements = steeringVector.size
+        steeringVector2D = steeringVector.reshape( (numberElements, 1) )
 
-        # TODO: Implement me.
-        return ConventionalWeights().compute( csm, steeringVector )
+        # Similar to the standard Capon weight algorithm, we have to hoist our complex vectors and
+        # matrices as real matrices in order for Picos to properly handle them.
+        liftedCsm = np.bmat( [[np.real( csm ), -np.imag( csm )],
+                               [np.imag( csm ), np.real( csm )]] )
+
+        liftedSteeringVector = np.vstack( [np.vstack( [np.real( sv ),
+                                                       np.imag( sv )] ) for sv in steeringVector2D] )
+
+        P = pic.Problem()
+        weights = P.add_variable( "weights", (2 * numberElements, 1) )
+        csmParam = pic.new_param( "csm", liftedCsm )
+        steeringVectorParam = pic.new_param( 'steeringVector', liftedSteeringVector )
+        steeringVectorErrorParamInv = pic.new_param( "steeringVectorError",
+                                                    1.0 / self._steeringVectorError )
+
+        # In the robust optimization case, our constraint becomes w*v >= eps * ||w|| + 1. Again, w
+        # is the weight vector and v is the steering vector. The value eps here is some known upper
+        # bound on the error we can expect in our steering vector, i.e., basically the degree of
+        # mismatch. As noted in the above paper, this is actually a second-order cone constraint.
+        #
+        # When we hoist this to be real-valued, we again lift the weight vector to the vector
+        # [Re(weights) ; -Im(weights)]. The right hand side of the constraint technically becomes
+        # the vector [ eps * ||w|| + 1 ; 0]; however, it's actually not possible to model this
+        # constraint verbatim as a vector inequality using Picos. Three problems arise in doing so.
+        #
+        # The first is that Picos doesn't like norm expressions being combined with any other affine
+        # expression (e.g., multiplication and addition by scalar values). Thus we have to isolate
+        # the norm expression to one side of the constraint. This causes our lifted constraint to
+        # be transformed into (w'v - [1 ; 0]) * (1 / eps) >= [ ||w|| ; 0 ]. Note here that in the lifted
+        # constraint, the conjugate transpose turns into simply the transpose.
+        #
+        # This immediately creates the second problem with Picos. Namely, it does not like having a
+        # matrix where one of its entries is defined by the norm of some variable. We easily work
+        # around this by enumerating each of the following constraints explicitly (where [i] denotes
+        # the ith quantity in the vector):
+        #
+        #     ((w'v)[0] - 1) * (1 / eps) >= ||w||
+        #     ((w'v)[1] - 0) * (1 / eps) == 0
+        #
+        # We actually impose equality on the second constraint because in the complex formulation we
+        # want the left hand side to be real-valued.
+        #
+        # The first constraint in the above list is actually a second order cone constraint. The way
+        # it is written right now though leads to a third, albeit trivial, problem, and that is that
+        # Picos does not define the >= for norm expressions on the right hand side. Instead, as per
+        # the library's documentation (http://picos.zib.de/expression.html#picos.Norm), the proper
+        # operator for expressing an inequality with a norm expression is with < which is used for
+        # expressing a less than *or equal to* constraint. With these issues all resolved, we are
+        # then able to model the robust optimization problem using Picos.
+        #
+        w_r = weights[0:numberElements]
+        w_i = weights[numberElements:]
+        top = functools.reduce( lambda x, y: x & y, (wi_r & wi_i for wi_r, wi_i in zip( w_r, w_i )) )
+        bottom = functools.reduce( lambda x, y: x & y, (-wi_i & wi_r for wi_r, wi_i in zip( w_r, w_i )) )
+        liftedWeightsConj = top // bottom
+        lhs = steeringVectorErrorParamInv * (liftedWeightsConj * steeringVectorParam - np.array( [[1.0], [0.0]] ))
+        P.add_constraint( pic.tools.norm( weights ) < lhs[0] )
+        P.add_constraint( lhs[1] == 0.0 )
+
+        P.set_objective( "min", weights.T * csmParam * weights )
+        P.solve( verbose=0 )
+
+        # We extract out the real and imaginary parts from our weight vector and return it as a
+        # complex 1D array.
+        return np.array( weights.value[0:numberElements] +
+                        1j * weights.value[numberElements:] ).reshape( numberElements  )
 
 class SlidingWindow:
     @classmethod
@@ -1233,8 +1356,6 @@ def updateRunningSum( slidingWindow, newBlock, runningSum ):
     runningSum -= slidingWindow.FirstBlock
     if newBlock is not None:
         runningSum += newBlock
-
-## OUTPUT SETUP ##
 
 def plotArrayGeometry( geometry,
                       plotSize=(5.0, 8.0),
@@ -1349,7 +1470,6 @@ def plotPowerSpectra( fftFileName,
                 _ = ax[axRow, axCol].grid( True, which="both" )
                 _ = ax[axRow, axCol].set_ylabel( "Frequency (Hz)" )
                 _ = ax[axRow, axCol].set_ylabel( "Power (dB)" )
-
 
 if __name__ == "__main__":
     import time
@@ -1622,10 +1742,10 @@ if __name__ == "__main__":
 
     print( "Forming output beams with robust Capon beamformer..." )
     startTime = time.time()
-    if False:
+    if process:
         beamformer.process( elementFftFileName,
                            robustCaponBeamformedFftFileName,
-                           RobustCaponWeights( ) )
+                           RobustCaponWeights( steeringVectorError=0.1 ) )
     robustCaponTime = time.time() - startTime
 
     #####
@@ -1666,6 +1786,10 @@ if __name__ == "__main__":
 
     plotPowerSpectra( caponBeamformedFftFileName,
                      figureTitle="Capon beamformed spectra for first simulated snapshot",
+                     plotTitleFormatter=lambda iBeam: "Beam %d" % (iBeam + 1) )
+
+    plotPowerSpectra( robustCaponBeamformedFftFileName,
+                     figureTitle="Robust Capon beamformed spectra for first simulated snapshot",
                      plotTitleFormatter=lambda iBeam: "Beam %d" % (iBeam + 1) )
 
 ## This test demonstrates how a denormal number time[5] fed into sig.sawtooth produces a NaN ##
