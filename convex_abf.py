@@ -1,16 +1,8 @@
-# https://www.cs.ccu.edu.tw/~wtchu/courses/2012s_DSP/Lectures/Lecture%203%20Complex%20Exponential%20Signals.pdf
-# http://www.labbookpages.co.uk/audio/beamforming/delayCalc.html
-# https://skynet.ee.ic.ac.uk/papers/2011_C_MathsInDefence_VirtualLinearArray.pdf
-# https://en.wikipedia.org/wiki/Sensor_array
-# http://www.comm.utoronto.ca/~rsadve/Notes/ArrayTheory.pdf
-# https://research.ijcaonline.org/volume61/number11/pxc3884758.pdf
-# http://www.personal.psu.edu/faculty/m/x/mxm14/sonar/beamforming.pdf
-# http://www.uio.no/studier/emner/matnat/ifi/INF5410/v12/undervisningsmateriale/foils/AdaptiveBeamforming.pdf
-
 import functools
 import itertools
 import multiprocessing
 import pathlib
+import re
 import struct
 
 import numpy as np
@@ -19,9 +11,6 @@ import scipy as sp
 import scipy.signal as sig
 
 import picos as pic
-
-from matplotlib import animation, rc
-from IPython.display import HTML
 
 #plt.ion()
 
@@ -855,7 +844,7 @@ class Beamformer:
     def _NumberBeams( self ):
         return len( self._outputBeams )
 
-    def process( self, inputFileName, outputFileName, weightAlgorithm ):
+    def process( self, inputFileName, outputFileName, weightAlgorithm, snapshotsToProcess=np.inf ):
         with FourierSpectra.open( inputFileName ) as inputFft:
             # Figure out the frequency band we're going to process.
             iStartBin, iStopBin = self._getBinIndicesToProcess( inputFft.BinFrequencies )
@@ -868,9 +857,11 @@ class Beamformer:
             with FourierSpectra.create( inputFft.FftLength, inputFft.SamplingRate,
                                        self._NumberBeams, numberBins, binFrequencies,
                                        outputFileName ) as outputFft:
-                self._innerProcess( inputFft, outputFft, iStartBin, iStopBin, weightAlgorithm )
+                self._innerProcess( inputFft, outputFft, iStartBin, iStopBin, weightAlgorithm,
+                                   snapshotsToProcess )
 
-    def _innerProcess( self, inputFft, outputFft, iStartBin, iStopBin, weightAlgorithm ):
+    def _innerProcess( self, inputFft, outputFft, iStartBin, iStopBin, weightAlgorithm,
+                      snapshotsToProcess ):
         numberBufferedSnapshots = self._snapshotAverageCount
         numberInputBins = inputFft.NumberBins
         numberOutputBins = iStopBin - iStartBin
@@ -895,6 +886,9 @@ class Beamformer:
             snapshotsToKeep = 0
             iOutputSnapshot = 0
             while True:
+                if iOutputSnapshot == snapshotsToProcess:
+                    break
+
                 numberNewSnapshots = self._readNextSnapshots( inputFft, inputSnapshots, snapshotsToKeep )
                 numberValidSnapshots = snapshotsToKeep + numberNewSnapshots
                 numberAvailableCsms = numberValidSnapshots - self._snapshotAverageCount + 1
@@ -1229,7 +1223,7 @@ class RobustCaponWeights:
         P = pic.Problem()
         weights = P.add_variable( "weights", (2 * numberElements, 1) )
         csmParam = pic.new_param( "csm", liftedCsm )
-        steeringVectorParam = pic.new_param( 'steeringVector', liftedSteeringVector )
+        steeringVectorParam = pic.new_param( "steeringVector", liftedSteeringVector )
         steeringVectorErrorParamInv = pic.new_param( "steeringVectorError",
                                                     1.0 / self._steeringVectorError )
 
@@ -1246,8 +1240,8 @@ class RobustCaponWeights:
         # The first is that Picos doesn't like norm expressions being combined with any other affine
         # expression (e.g., multiplication and addition by scalar values). Thus we have to isolate
         # the norm expression to one side of the constraint. This causes our lifted constraint to
-        # be transformed into (w'v - [1 ; 0]) * (1 / eps) >= [ ||w|| ; 0 ]. Note here that in the lifted
-        # constraint, the conjugate transpose turns into simply the transpose.
+        # be transformed into (w'v - [1 ; 0]) * (1 / eps) >= [ ||w|| ; 0 ]. Note here that in the
+        # lifted constraint, the conjugate transpose turns into simply the transpose.
         #
         # This immediately creates the second problem with Picos. Namely, it does not like having a
         # matrix where one of its entries is defined by the norm of some variable. We easily work
@@ -1406,7 +1400,7 @@ def plotTimeSeries( etsFileName,
 
         title = figureTitle or "Element Time Series"
         fig.suptitle( title, y=1, fontsize=14 )
-        fig.tight_layout( pad=4, h_pad=2, w_pad=2 )
+        fig.tight_layout( pad=4, h_pad=4, w_pad=6 )
 
         for iElement in range( etsFile.NumberElements ):
             axRow = int(iElement / plotsPerRow)
@@ -1417,6 +1411,8 @@ def plotTimeSeries( etsFileName,
             _ = ax[axRow, axCol].plot( sampleTimes, samples[:, iElement] )
             _ = ax[axRow, axCol].set_title( plotTitle )
             _ = ax[axRow, axCol].grid( True, which="both" )
+            _ = ax[axRow, axCol].set_xlabel( "Time (sec)" )
+            _ = ax[axRow, axCol].set_ylabel( "Amplitude (V)" )
 
 def plotPowerSpectra( fftFileName,
                      numberSnapshots=1,
@@ -1445,17 +1441,18 @@ def plotPowerSpectra( fftFileName,
                                    squeeze=False )
 
             # Disable those subplots that aren't actually going to be used.
-            iUnusedAxes = np.unravel_index( [i for i in range( fftFile.NumberChannels, ax.size )],
-                                             ax.shape )
-            for unusedAxis in ax[iUnusedAxes]:
-                unusedAxis.set_visible( False )
+            if fftFile.NumberChannels != ax.size:
+                iUnusedAxes = np.unravel_index( [i for i in range( fftFile.NumberChannels, ax.size )],
+                                                 ax.shape )
+                for unusedAxis in ax[iUnusedAxes]:
+                    unusedAxis.set_visible( False )
 
             if not figureTitle:
                 figureTitle = (figureTitleFormatter( iSnapshot ) if figureTitleFormatter
                                else ("Fourier Spectra Snapshot %d" % (iSnapshot + 1)))
 
             fig.suptitle( figureTitle, y=1, fontsize=14 )
-            fig.tight_layout( pad=4, h_pad=3, w_pad=4 )
+            fig.tight_layout( pad=4, h_pad=4, w_pad=4 )
 
             for iChannel in range( fftFile.NumberChannels ):
                 axRow = int(iChannel / plotsPerRow)
@@ -1468,7 +1465,7 @@ def plotPowerSpectra( fftFileName,
                 _ = ax[axRow, axCol].plot( binFrequencies, channelDb )
                 _ = ax[axRow, axCol].set_title( channelTitle )
                 _ = ax[axRow, axCol].grid( True, which="both" )
-                _ = ax[axRow, axCol].set_ylabel( "Frequency (Hz)" )
+                _ = ax[axRow, axCol].set_xlabel( "Frequency (Hz)" )
                 _ = ax[axRow, axCol].set_ylabel( "Power (dB)" )
 
 if __name__ == "__main__":
@@ -1478,7 +1475,7 @@ if __name__ == "__main__":
     warnings.filterwarnings( "ignore", module="matplotlib" )
 
     # This is a flag used to quickly toggle off processing so that we don't regenerate all data.
-    process = True
+    process = False
 
     #####
     # In this section we will be deriving parameters for our array based on more-or-less good rules
@@ -1729,7 +1726,8 @@ if __name__ == "__main__":
     if process:
         beamformer.process( elementFftFileName,
                            conventionalBeamformedFftFileName,
-                           ConventionalWeights() )
+                           ConventionalWeights(),
+                           snapshotsToProcess=1 )
     conventionalTime = time.time() - startTime
 
     print( "Forming output beams with standard Capon beamformer..." )
@@ -1737,7 +1735,8 @@ if __name__ == "__main__":
     if process:
         beamformer.process( elementFftFileName,
                            caponBeamformedFftFileName,
-                           CaponWeights() )
+                           CaponWeights(),
+                           snapshotsToProcess=1 )
     caponTime = time.time() - startTime
 
     print( "Forming output beams with robust Capon beamformer..." )
@@ -1745,7 +1744,8 @@ if __name__ == "__main__":
     if process:
         beamformer.process( elementFftFileName,
                            robustCaponBeamformedFftFileName,
-                           RobustCaponWeights( steeringVectorError=0.1 ) )
+                           RobustCaponWeights( steeringVectorError=0.1 ),
+                           snapshotsToProcess=1 )
     robustCaponTime = time.time() - startTime
 
     #####
@@ -1774,23 +1774,95 @@ if __name__ == "__main__":
     # simulation.
     plotTimeSeries( etsFileName,
                    numberSeconds = 2.0 / primaryTarget._frequency,
-                   figureTitle="Element time series for first simulated snapshot" )
+                   figureTitle="Element time series for first snapshot" )
 
     plotPowerSpectra( elementFftFileName,
                      band=FrequencyBand( 50.0, 130.0 ),
-                     figureTitle="Fourier spectra for first simulated snapshot" )
+                     plotsPerRow=3,
+                     figureTitle="Element-level frequency spectra for first snapshot" )
 
     plotPowerSpectra( conventionalBeamformedFftFileName,
-                     figureTitle="Conventionally beamformed spectra for first simulated snapshot",
-                     plotTitleFormatter=lambda iBeam: "Beam %d" % (iBeam + 1) )
+                     plotsPerRow=3,
+                     figureTitle="Conventionally beamformed frequency spectra for first snapshot",
+                     plotTitleFormatter=lambda iBeam: "Beam %d (az = %g°)" %
+                     (iBeam + 1, outputBeams[iBeam].Azimuth) )
 
     plotPowerSpectra( caponBeamformedFftFileName,
-                     figureTitle="Capon beamformed spectra for first simulated snapshot",
-                     plotTitleFormatter=lambda iBeam: "Beam %d" % (iBeam + 1) )
+                     plotsPerRow=3,
+                     figureTitle="Standard Capon beamformed frequency spectra for first snapshot",
+                     plotTitleFormatter=lambda iBeam: "Beam %d (az = %g°)" %
+                     (iBeam + 1, outputBeams[iBeam].Azimuth) )
 
     plotPowerSpectra( robustCaponBeamformedFftFileName,
-                     figureTitle="Robust Capon beamformed spectra for first simulated snapshot",
-                     plotTitleFormatter=lambda iBeam: "Beam %d" % (iBeam + 1) )
+                     plotsPerRow=3,
+                     figureTitle="Robust Capon beamformed frequency spectra for first snapshot",
+                     plotTitleFormatter=lambda iBeam: "Beam %d (az = %g°)" %
+                     (iBeam + 1, outputBeams[iBeam].Azimuth) )
+
+    #####
+    # Below we investigate the performance of the adaptive beamformer using the standard Capon
+    # weights versus the robust Capon weights. For this, we will form two beams that are not
+    # focused directly at our targets in our simulated time series. This will allow us to model
+    # what happens when there is a mismatch between our steering vector and the actual direction
+    # of arrival for each signal.
+    #
+    # As will be demonstrated, the standard Capon weights will create a self-nulling effect where
+    # our signal of interest is completely removed from the beamformer's output response. This is
+    # due to the fact that the signal, now no longer perfectly aligned with our steering vector,
+    # appears as interference when the phase shifts induced by the weights are applied.
+    #
+    # The robust Capon weighting takes into consideration some fixed upper bound on the steering
+    # vector error when it performs its optimization. As a consequence, for a sufficiently high
+    # value of epsilon (our steering vector error), the robust Capon weighting algorithm is able
+    # to preserve the signal of interest in the face of steering vector error.
+    #
+    mismatchedBeams = (Beam( -26.0 ),
+                       Beam( -47.0 ))
+
+    mismatchedBeamformer = Beamformer( geometry, mismatchedBeams, frequencyBandToProcess,
+                            snapshotAverageCount=2 * geometry.NumberElements,
+                            speedOfSound=speedOfSound )
+
+    mismatchCaponBeamformedFftFileName = str( outputFolder / "beamformedSpectraCaponMismatch.fft" )
+    mismatchRobustCaponBeamformedFftBaseName = "beamformedSpectraRobustCaponMismatch"
+
+    print( "Forming mismatched beams with standard Capon beamformer..." )
+    if process:
+        mismatchedBeamformer.process( elementFftFileName,
+                                     mismatchCaponBeamformedFftFileName,
+                                     CaponWeights(),
+                                     snapshotsToProcess=1 )
+
+    # Perform the robust beamforming for several values of epsilon, our steering vector error, so
+    # that we can plot the effect it has on the beamformer's output.
+    steeringVectorErrors = np.linspace( 0.1, 1.5, 15, endpoint=True )
+    if process:
+        for error in steeringVectorErrors:
+            outputFilename = str( outputFolder /
+                                 ("%s-eps%.1f.fft" %
+                                  (mismatchRobustCaponBeamformedFftBaseName, error)) )
+
+            print( "Forming mismatched beams with robust Capon beamformer with epsilon = %.1f..." % error )
+            mismatchedBeamformer.process( elementFftFileName,
+                                         outputFilename,
+                                         RobustCaponWeights( steeringVectorError=error ),
+                                         snapshotsToProcess=1 )
+
+    # Plot the results of both the standard Capon and robust Capon weights.
+    plotPowerSpectra( mismatchCaponBeamformedFftFileName,
+                     figureTitle="Standard Capon beamformed frequency spectra for first snapshot with mismatch",
+                     plotTitleFormatter=lambda iBeam: "Beam %d (az = %g°)" %
+                     (iBeam + 1, mismatchedBeams[iBeam].Azimuth) )
+
+    robustMismatchFileNames = outputFolder.glob( "%s-eps*" % mismatchRobustCaponBeamformedFftBaseName )
+    for robustMismatchFileName in (str( fileName ) for fileName in robustMismatchFileNames):
+        match = re.search( "%s-eps([\d]\.[\d])\.fft" % mismatchRobustCaponBeamformedFftBaseName,
+                         robustMismatchFileName )
+        error, = match.groups()
+        plotPowerSpectra( robustMismatchFileName,
+                         figureTitle="Robust Capon beamformed frequency spectra for first snapshot with mismatch (epsilon = %s)" % error,
+                         plotTitleFormatter=lambda iBeam: "Beam %d (az = %g°)" %
+                         (iBeam + 1, mismatchedBeams[iBeam].Azimuth) )
 
 ## This test demonstrates how a denormal number time[5] fed into sig.sawtooth produces a NaN ##
 #snapshotStartTime = 0.0
@@ -1807,6 +1879,16 @@ if __name__ == "__main__":
 # * Low pass filter generated signals so that they are band limited.
 #   * Make this a property of the Hydrophone class.
 #   * Or maybe a property of ArraySimulator (basically a block anti-alias filter)
+
+# Some of the original links obtained in researching all of this.
+# https://www.cs.ccu.edu.tw/~wtchu/courses/2012s_DSP/Lectures/Lecture%203%20Complex%20Exponential%20Signals.pdf
+# http://www.labbookpages.co.uk/audio/beamforming/delayCalc.html
+# https://skynet.ee.ic.ac.uk/papers/2011_C_MathsInDefence_VirtualLinearArray.pdf
+# https://en.wikipedia.org/wiki/Sensor_array
+# http://www.comm.utoronto.ca/~rsadve/Notes/ArrayTheory.pdf
+# https://research.ijcaonline.org/volume61/number11/pxc3884758.pdf
+# http://www.personal.psu.edu/faculty/m/x/mxm14/sonar/beamforming.pdf
+# http://www.uio.no/studier/emner/matnat/ifi/INF5410/v12/undervisningsmateriale/foils/AdaptiveBeamforming.pdf
 
 ## LINKS -- these are links I've piled up but haven't sifted through which are useful... ##
 ## some of these may be redundant with ones sprinkled in the code above ##
