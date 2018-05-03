@@ -338,6 +338,105 @@ class FourierSpectra:
     NumberChannelsHeaderFormat = "=Q"
     NumberBinsHeaderFormat = "=Q"
 
+class WeightsFile:
+    MODE_READ = 0
+    MODE_WRITE = 1
+
+    @classmethod
+    def create( cls, numberBins, numberBeams, numberElements, dataFileName ):
+        return cls( dataFileName, cls.MODE_WRITE, numberBins, numberBeams, numberElements )
+
+    @classmethod
+    def open( cls, dataFileName ):
+        return cls( dataFileName, cls.MODE_READ )
+
+    def writeSnapshot( self, snapshot ):
+        numberSnapshotBins, numberSnapshotBeams, numberSnapshotElements = snapshot.shape
+        assert numberSnapshotBins == self.NumberBins, \
+            "Number of bins per snapshot must be %d" % self.NumberBins
+        assert numberSnapshotBeams == self.NumberBeams, \
+            "Number of beams in snapshot must be %d" % self.NumberBeams
+        assert numberSnapshotElements == self.NumberElements, \
+            "Number of elements in snapshot must be %d" % self.NumberElements
+        assert snapshot.dtype == self._binDtype, \
+            "Snapshot data type must be %s" % self._weightDtype
+
+        self._dataFile.write( snapshot.tobytes() )
+
+    def readSnapshot( self ):
+        readSize = self.NumberBins * self.NumberBeams * self.NumberElements
+        snapshot = np.fromfile( self._dataFile, self._binDtype, readSize )
+        if snapshot.size > 0:
+            snapshot = np.reshape( snapshot, (self.NumberBins,
+                                              self.NumberBeams,
+                                              self.NumberElements) )
+        return snapshot
+
+    def _readHeader( self ):
+        self.NumberBins = self._readFieldFromFile( self.NumberBinsHeaderFormat,
+                                                  self.NumberBinsHeaderSize )
+        self.NumberBeams = self._readFieldFromFile( self.NumberBeamsHeaderFormat,
+                                                   self.NumberBeamsHeaderSize )
+        self.NumberElements = self._readFieldFromFile( self.NumberElementsHeaderFormat,
+                                                      self.NumberElementsHeaderSize )
+
+    def _readFieldFromFile( self, fieldFormat, fieldSizeBytes ):
+        # Note: struct.unpack returns a tuple even if there's only a single element.
+        return struct.unpack( fieldFormat, self._dataFile.read( fieldSizeBytes ) )[0]
+
+    def _writeHeader( self ):
+        self._writeFieldToFile( self.NumberBins, self.NumberBinsHeaderFormat )
+        self._writeFieldToFile( self.NumberBeams, self.NumberBeamsHeaderFormat )
+        self._writeFieldToFile( self.NumberElements, self.NumberElementsHeaderFormat )
+
+    def _writeFieldToFile( self, fieldValue, fieldFormat ):
+        self._dataFile.write( struct.pack( fieldFormat, fieldValue ) )
+
+    def __init__( self, dataFileName, mode, numberBins=None, numberBeams=None, numberElements=None ):
+        assert mode in (self.MODE_READ, self.MODE_WRITE)
+        assert dataFileName
+
+        if mode == self.MODE_WRITE:
+            assert numberBins > 0 and type(numberBins) is int, \
+                "Number of bins must be positive integer."
+
+            assert numberBeams > 0 and type(numberBeams) is int, \
+                "Number of beams must be positive integer."
+
+            assert numberElements > 0 and type(numberElements) is int, \
+                "Number of elements must be positive integer."
+
+        self._dataFileName = dataFileName
+        self._dataFile = None
+        self._mode = mode
+        self.NumberBins = numberBins
+        self.NumberBeams = numberBeams
+        self.NumberElements = numberElements
+        self._binDtype = np.dtype( np.complex128 )
+
+    def __enter__( self ):
+        fileMode = "rb" if self._mode == self.MODE_READ else "wb"
+        self._dataFile = open( self._dataFileName, fileMode )
+
+        if self._mode == self.MODE_READ:
+            self._readHeader()
+        else:
+            self._writeHeader()
+
+        return self
+
+    def __exit__( self, exc_type, exc_value, traceback ):
+        self._dataFile.close()
+
+    # File format constants
+    NumberBinsHeaderSize = 8
+    NumberBeamsHeaderSize = 8
+    NumberElementsHeaderSize = 8
+
+    NumberBinsHeaderFormat = "=Q"
+    NumberBeamsHeaderFormat = "=Q"
+    NumberElementsHeaderFormat = "=Q"
+
 class ArrayGeometry:
     @classmethod
     def createUniformLinear( cls, numberElements, elementSpacing ):
@@ -857,11 +956,15 @@ class Beamformer:
             with FourierSpectra.create( inputFft.FftLength, inputFft.SamplingRate,
                                        self._NumberBeams, numberBins, binFrequencies,
                                        outputFileName ) as outputFft:
-                self._innerProcess( inputFft, outputFft, iStartBin, iStopBin, weightAlgorithm,
-                                   snapshotsToProcess )
+
+                weightsFileName = "%s-weights" % outputFileName
+                with WeightsFile.create( numberBins, self._NumberBeams, self._NumberElements,
+                                        weightsFileName ) as weightsFile:
+                    self._innerProcess( inputFft, outputFft, iStartBin, iStopBin, weightAlgorithm,
+                                       snapshotsToProcess, weightsFile )
 
     def _innerProcess( self, inputFft, outputFft, iStartBin, iStopBin, weightAlgorithm,
-                      snapshotsToProcess ):
+                      snapshotsToProcess, weightsFile ):
         numberBufferedSnapshots = self._snapshotAverageCount
         numberInputBins = inputFft.NumberBins
         numberOutputBins = iStopBin - iStartBin
@@ -869,7 +972,9 @@ class Beamformer:
         numberElements = self._NumberElements
 
         # First precompute all of our steering vectors that we will use.
-        steeringVectors = self._computeSteeringVectors( inputFft.BinFrequencies[iStartBin:iStopBin] )
+        steeringVectors = computeSteeringVectors( inputFft.BinFrequencies[iStartBin:iStopBin],
+                                                 self._outputBeams, self._arrayGeometry,
+                                                 self._speedOfSound )
 
         # Allocate the output snapshot.
         outputSnapshot = np.empty( shape=(numberOutputBins, numberBeams), dtype=np.complex )
@@ -937,6 +1042,9 @@ class Beamformer:
                     #                                          currentCsmSnapshot )
 
 
+                # Write out the weights we computed this iteration.
+                weightsFile.writeSnapshot( np.array( weights ) )
+
                 # Write out this snapshot and compute how many snapshots we will keep for the next
                 # iteration. Note that number should be one less than the number we buffer.
                 outputFft.writeSnapshot( outputSnapshot )
@@ -997,59 +1105,55 @@ class Beamformer:
 
         return numberNewSnapshots
 
-    def _computeSteeringVectors( self, binFrequencies ):
-        """
-        Computes a steering vector for each input frequency for every output beam this beamformer
-        is configured for.
+def computeSteeringVectors( binFrequencies, beams, geometry, speedOfSound ):
+    """
+    Computes a steering vector for each input frequency for every beam.
 
-        The resulting 3D array of steering vectors is M x Q x N, where M is the number of
-        frequencies, Q is the number of beams, and N is the number of array elements. The way to
-        view this is that the mth slice is a set of Q steering vectors that steer the N elements of
-        the array in the directions of the corresponding beams.
+    The resulting 3D array of steering vectors is M x Q x N, where M is the number of frequencies,
+    Q is the number of beams, and N is the number of array elements. The way to view this is that
+    the mth slice is a set of Q steering vectors that steer the N elements of the array in the
+    directions of the corresponding beams.
 
-        Note that the steering vectors can consume A LOT of memory. Typically the frequency
-        dimension is the most dominant one. As such, one should be careful when picking how many
-        frequencies worth of steering vectors to compute.
+    Note that the steering vectors can consume A LOT of memory. Typically the frequency dimension is
+    the most dominant one. As such, one should be careful when picking how many frequencies worth of
+    steering vectors to compute.
 
-        """
-        # From Optimum Array Processing (p. 30), the steering vector (or array manifold vector) is
-        # a function of a directional wavenumber, i.e., a function of frequency and look direction
-        # (which in turn is defined by an azimuth phi and a polar angle theta). The steering vector
-        # v(k) = [exp(-j * (k . p1))  |  exp(-j * (k . p2))  | ...  |  exp(-j * (k . pN))].
-        #
-        # The Cartesian coordinate for each array element I is given by pI. The wavenumber k is
-        # given by k = -2 * pi * f / c * A, where f is the frequency of the plane wave corresponding
-        # to the computed steering vector and c is the speed at which the plane wave is propagating.
-        # A is a unit vector defined in terms of the spherical coordinates of the plane wave's
-        # source and is given by the following:
-        #
-        #     [ -sin(theta) * cos(phi)
-        #       -sin(theta) * sin(phi)
-        #       -cos(theta) ]
-        #
-        # The imaginary unit is given by j.
-        #
-        numberElements = self._NumberElements
-        numberBeams = self._NumberBeams
-        twoPiOverC = 2.0 * np.pi / self._speedOfSound
+    """
+    # From Optimum Array Processing (p. 30), the steering vector (or array manifold vector) is
+    # a function of a directional wavenumber, i.e., a function of frequency and look direction
+    # (which in turn is defined by an azimuth phi and a polar angle theta). The steering vector
+    # v(k) = [exp(-j * (k . p1))  |  exp(-j * (k . p2))  | ...  |  exp(-j * (k . pN))].
+    #
+    # The Cartesian coordinate for each array element I is given by pI. The wavenumber k is
+    # given by k = -2 * pi * f / c * A, where f is the frequency of the plane wave corresponding
+    # to the computed steering vector and c is the speed at which the plane wave is propagating.
+    # A is a unit vector defined in terms of the spherical coordinates of the plane wave's
+    # source and is given by the following:
+    #
+    #     [ -sin(theta) * cos(phi)
+    #       -sin(theta) * sin(phi)
+    #       -cos(theta) ]
+    #
+    # The imaginary unit is given by j.
+    #
+    numberElements = geometry.NumberElements
+    numberBeams = len( beams )
+    twoPiOverC = 2.0 * np.pi / speedOfSound
 
-        beamCartesian = (sphericalToUnitCartesian( beam.Azimuth, beam.PolarAngle ) \
-                         for beam in self._outputBeams)
-        beamCartesianFlat = itertools.chain.from_iterable( beamCartesian )
+    beamCartesian = (sphericalToUnitCartesian( beam.Azimuth, beam.PolarAngle ) for beam in beams)
+    beamCartesianFlat = itertools.chain.from_iterable( beamCartesian )
 
-        elementCartesian = zip( self._arrayGeometry.X,
-                               self._arrayGeometry.Y,
-                               self._arrayGeometry.Z )
-        elementCartesianFlat = itertools.chain.from_iterable( elementCartesian )
+    elementCartesian = zip( geometry.X, geometry.Y, geometry.Z )
+    elementCartesianFlat = itertools.chain.from_iterable( elementCartesian )
 
-        # NOTE: np.fromiter only works on 1D iterables to make 1D arrays, so we flatten our beam
-        # and element Cartesian coordinates to create the array and then reshape them respectively
-        # to the appropriate Q x 3 and N x 3 arrays.
-        return np.exp( 1j *
-                      np.einsum( 'm,qi,ni->mqn',
-                                twoPiOverC * binFrequencies,
-                                np.fromiter( beamCartesianFlat, np.float, numberBeams * 3 ).reshape( (numberBeams, 3) ),
-                                np.fromiter( elementCartesianFlat, np.float, numberElements * 3 ).reshape( (numberElements, 3) ) ) )
+    # NOTE: np.fromiter only works on 1D iterables to make 1D arrays, so we flatten our beam
+    # and element Cartesian coordinates to create the array and then reshape them respectively
+    # to the appropriate Q x 3 and N x 3 arrays.
+    return np.exp( 1j *
+                  np.einsum( 'm,qi,ni->mqn',
+                            twoPiOverC * binFrequencies,
+                            np.fromiter( beamCartesianFlat, np.float, numberBeams * 3 ).reshape( (numberBeams, 3) ),
+                            np.fromiter( elementCartesianFlat, np.float, numberElements * 3 ).reshape( (numberElements, 3) ) ) )
 
 def sphericalToUnitCartesian( azimuth, polar ):
     polar = np.radians( polar )
@@ -1854,7 +1958,9 @@ if __name__ == "__main__":
                      plotTitleFormatter=lambda iBeam: "Beam %d (az = %g°)" %
                      (iBeam + 1, mismatchedBeams[iBeam].Azimuth) )
 
-    robustMismatchFileNames = outputFolder.glob( "%s-eps*" % mismatchRobustCaponBeamformedFftBaseName )
+    robustMismatchFileNames = outputFolder.glob( "%s-eps*.fft" %
+                                                mismatchRobustCaponBeamformedFftBaseName )
+
     for robustMismatchFileName in (str( fileName ) for fileName in robustMismatchFileNames):
         match = re.search( "%s-eps([\d]\.[\d])\.fft" % mismatchRobustCaponBeamformedFftBaseName,
                          robustMismatchFileName )
