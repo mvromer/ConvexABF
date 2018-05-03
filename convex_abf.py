@@ -533,40 +533,9 @@ class ArraySimulator:
 
     def addTarget( self, target ):
         self._targets.append( target )
-        self._targetTimeDelays.append( self.computeElementTimeDelay( target.Position ) )
-
-    def computeElementTimeDelay( self, sourcePosition ):
-        """
-        Computes the time delays for each element in the array when a signal propagating from a
-        source located at the given PositionAzEl impinges on the phase center of the array, which is
-        taken to be the origin of the local coordinate system.
-
-        If the range of the signal origin is finite, then the source is presumed to be in the near
-        field. If the range goes out to infinity, then the source is presumed to be in the far
-        field. Signals for sources in the far field appear to have planar wavefronts to the array
-        elements.
-
-        Note that only sources in the far field are supported at this time.
-
-        """
-        if sourcePosition.Range < np.inf:
-            raise NotImplementedError( "Near field sources not supported at this time." )
-
-        # Derived from Optimum Array Procesing page 29. If A is a unit vector defining the direction
-        # of propagation for the planar wavefront impinging on the array's phase center and P is the
-        # position of an array element, then the time delay tau for the element is given by
-        # (A . P) / c, where c is the speed of the wavefront's propagation. A is defined in terms of
-        # the spherical coordinates of the signal's source as follows:
-        #
-        #     [ -sin(theta) * cos(phi)
-        #       -sin(theta) * sin(phi)
-        #       -cos(theta) ]
-        #
-        xA, yA, zA = sphericalToUnitCartesian( sourcePosition.Azimuth, sourcePosition.PolarAngle )
-        dotProducts = np.sum( np.stack( (xA * self._geometry.X,
-                                         yA * self._geometry.Y,
-                                         zA * self._geometry.Z) ), axis=0 )
-        return -1.0 / self._speedOfSound * dotProducts
+        self._targetTimeDelays.append( computeElementTimeDelay( target.Position,
+                                                               self._geometry,
+                                                               self._speedOfSound ) )
 
     def simulate( self, numberSnapshots, fileName ):
         """
@@ -1105,6 +1074,38 @@ class Beamformer:
 
         return numberNewSnapshots
 
+def computeElementTimeDelay( sourcePosition, geometry, speedOfSound ):
+    """
+    Computes the time delays for each element in the array when a signal propagating from a source
+    located at the given PositionAzEl impinges on the phase center of the array, which is taken to
+    be the origin of the local coordinate system.
+
+    If the range of the signal origin is finite, then the source is presumed to be in the near
+    field. If the range goes out to infinity, then the source is presumed to be in the far field.
+    Signals for sources in the far field appear to have planar wavefronts to the array elements.
+
+    Note that only sources in the far field are supported at this time.
+
+    """
+    if sourcePosition.Range < np.inf:
+        raise NotImplementedError( "Near field sources not supported at this time." )
+
+    # Derived from Optimum Array Procesing page 29. If A is a unit vector defining the direction
+    # of propagation for the planar wavefront impinging on the array's phase center and P is the
+    # position of an array element, then the time delay tau for the element is given by
+    # (A . P) / c, where c is the speed of the wavefront's propagation. A is defined in terms of
+    # the spherical coordinates of the signal's source as follows:
+    #
+    #     [ -sin(theta) * cos(phi)
+    #       -sin(theta) * sin(phi)
+    #       -cos(theta) ]
+    #
+    xA, yA, zA = sphericalToUnitCartesian( sourcePosition.Azimuth, sourcePosition.PolarAngle )
+    dotProducts = np.sum( np.stack( (xA * geometry.X,
+                                     yA * geometry.Y,
+                                     zA * geometry.Z) ), axis=0 )
+    return -1.0 / speedOfSound * dotProducts
+
 def computeSteeringVectors( binFrequencies, beams, geometry, speedOfSound ):
     """
     Computes a steering vector for each input frequency for every beam.
@@ -1579,7 +1580,7 @@ if __name__ == "__main__":
     warnings.filterwarnings( "ignore", module="matplotlib" )
 
     # This is a flag used to quickly toggle off processing so that we don't regenerate all data.
-    process = True
+    process = False
 
     #####
     # In this section we will be deriving parameters for our array based on more-or-less good rules
